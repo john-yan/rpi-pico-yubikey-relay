@@ -11,3 +11,4 @@ __pycache__/
 
 # Firmware images (kept locally, not tracked)
 *.uf2
+.venv/

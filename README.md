@@ -128,7 +128,9 @@ TinyUSB-based build like the Feather RP2040 USB Host's Arduino offering).
 
 - **Keyboard (OTP) and CTAPHID cannot run simultaneously** (see modes above).
 - **Onboard LED status**: slow blink = waiting for the YubiKey or power-
-  cycling it, solid = relay attached and running.
+  cycling it, fast blink = the YubiKey is waiting for a user touch
+  (detected from CTAPHID KEEPALIVE packets), solid = relay attached and
+  running.
 - A short read timeout can abort a transfer exactly as data lands, surfacing
   as a bare USBError; the loop retries these and only tears down after six
   consecutive errors (a real device fault). After the teardown it

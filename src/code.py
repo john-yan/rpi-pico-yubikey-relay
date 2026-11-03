@@ -73,7 +73,7 @@ time.sleep(0.1)
 yubikey_power(True)
 
 # Onboard LED status: slow blink = waiting for YubiKey (or power-cycling
-# it), solid = relay attached and running.
+# it), fast blink = YubiKey waiting for a user touch, solid = relaying.
 led = digitalio.DigitalInOut(board.LED)
 led.direction = digitalio.Direction.OUTPUT
 
@@ -255,6 +255,7 @@ while True:
 
         pending_conts = 0  # CONT packets the host still owes for this message
         resp_pending = 0  # CONT packets the YubiKey still owes for its response
+        touch_pending = False  # KEEPALIVE reports the key awaits a finger
         read_ms = IDLE_MS
         read_errors = 0  # consecutive spurious USBErrors on downstream reads
 
@@ -310,6 +311,15 @@ while True:
                     else:  # response continuation packet
                         if resp_pending > 0:
                             resp_pending -= 1
+                    # Touch detection (observation only, no protocol change):
+                    # a KEEPALIVE (cmd 0x3B -> 0xBB on the wire) with status
+                    # 0x02 means the key is waiting for user presence; any
+                    # other response packet means the ceremony was answered
+                    # (or cancelled).
+                    if cmd_byte == 0xBB:
+                        touch_pending = ctap_buf[7] == 2
+                    elif cmd_byte & 0x80:
+                        touch_pending = False
                     # stay open only while response CONTs are still due;
                     # once the transaction completes, return to drain
                     # priority so the next request is never starved.
@@ -324,6 +334,10 @@ while True:
                     for i in range(n, KBD_REPORT_LEN):
                         kbd_buf[i] = 0
                     kbd_upstream.send_report(kbd_buf)
+
+            # LED: solid = relaying, fast blink (~8 Hz) = waiting for touch.
+            # Wall-clock based, so the poll loop is never blocked.
+            led.value = (not touch_pending) or bool(int(time.monotonic() * 8) & 1)
 
     except (usb.core.USBError, OSError) as e:
         # Bus error or disconnect: tear down and re-enumerate (fault tolerance).
