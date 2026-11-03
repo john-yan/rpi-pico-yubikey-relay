@@ -40,12 +40,7 @@ pinned version with `make download` (or another via
 3. **Hard-reset the Pico** (replug or `microcontroller.reset()`), then plug
    the YubiKey in once the LED is blinking (10.3.1 misses a device attached
    around host init; hot-plug after boot is reliable).
-4. Install the udev rule (one time, for browser access):
-
-   ```bash
-   sudo cp 70-pico-yubikey-relay.rules /etc/udev/rules.d/
-   sudo udevadm control --reload-rules && sudo udevadm trigger
-   ```
+4. Install the udev rule (one time, for browser access): `make install-rules`
 
 5. Verify: `make test` → should print INIT + PING ok (or `make e2e` for the
    full deploy-reload-verify pipeline).
@@ -58,6 +53,7 @@ pinned version with `make download` (or another via
 | `make deploy-debug` | Deploy the tracing build as code.py (packet-header logging — see warning) |
 | `make reset` | Hard-reset the board; applies boot.py changes, GP5 re-attaches the YubiKey |
 | `make download [VERSION=10.3.1]` | Fetch a CircuitPython uf2 image (git-ignored) |
+| `make install-rules` / `make remove-rules` | Install / remove the udev hidraw-access rule (sudo; idempotent) |
 | `make flash UF2=<file>` | Flash firmware (Pico in BOOTSEL mode; RPI-RP2 drive must be mounted) |
 | `make test` | Host-side CTAPHID verification against the running relay |
 | `make e2e` | Full pipeline: deploy production code, soft-reload, verify, capture the relay log |

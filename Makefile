@@ -10,7 +10,10 @@ BOOTSEL   ?= /run/media/$(USER)/RPI-RP2
 CP_VERSION ?= 10.3.1
 CP_URL = https://downloads.circuitpython.org/bin/raspberry_pi_pico/en_US/adafruit-circuitpython-raspberry_pi_pico-en_US-$(CP_VERSION).uf2
 
-.PHONY: help download flash deploy deploy-debug reset test e2e check debug log clean
+RULES_FILE = 70-pico-yubikey-relay.rules
+RULES_DEST = /etc/udev/rules.d/$(RULES_FILE)
+
+.PHONY: help download flash deploy deploy-debug reset test e2e check debug log install-rules remove-rules clean
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | \
@@ -67,6 +70,26 @@ debug: ## Regenerate code_debug.py from code.py
 
 log: ## Passively listen to the relay console (SECS=15)
 	python3 utils/listen_repl.py $(SECS)
+
+install-rules: ## Install the udev rule so the user can access the relay's hidraw node
+	@if [ -f "$(RULES_DEST)" ] && cmp -s "$(RULES_FILE)" "$(RULES_DEST)"; then \
+		echo "udev rule already installed and up to date."; \
+	else \
+		sudo cp "$(RULES_FILE)" "$(RULES_DEST)"; \
+		sudo udevadm control --reload-rules; \
+		sudo udevadm trigger; \
+		echo "Installed $(RULES_DEST) (browsers can now reach the relay)."; \
+	fi
+
+remove-rules: ## Remove the udev rule (revokes user access to the relay's hidraw node)
+	@if [ -f "$(RULES_DEST)" ]; then \
+		sudo rm "$(RULES_DEST)"; \
+		sudo udevadm control --reload-rules; \
+		sudo udevadm trigger; \
+		echo "Removed $(RULES_DEST)."; \
+	else \
+		echo "udev rule is not installed."; \
+	fi
 
 clean: ## Remove Python cache dirs
 	@rm -r __pycache__ test/__pycache__ 2>/dev/null || true
