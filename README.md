@@ -22,10 +22,10 @@ relaying FIDO2/WebAuthn traffic (and optionally OTP keystrokes) transparently.
 | `test/e2e_test.py` | Deploys code (default: production `src/code.py`), reloads the board, runs CTAPHID INIT/PING checks (helpers imported from `test_ctaphid.py`), captures the relay log |
 | `utils/read_repl.py` / `utils/send_repl.py` / `utils/listen_repl.py` | Serial console helpers for /dev/ttyACM0 |
 | `70-pico-yubikey-relay.rules` | udev rule so browsers/tests can access the relay's hidraw node |
-Firmware images (`circuitpython-pico-*.uf2`) are kept locally next to the
-repo as rollback copies but are git-ignored — fetch them from
-[circuitpython.org](https://circuitpython.org/board/raspberry_pi_pico/)
-if you need them.
+Firmware images (`circuitpython-pico-*.uf2`) are git-ignored; fetch the
+pinned version with `make download` (or another via
+`make download VERSION=11.0.0-alpha.2`) from
+[circuitpython.org](https://circuitpython.org/board/raspberry_pi_pico/).
 
 ## Deployment
 
@@ -35,12 +35,8 @@ if you need them.
    ([circuitpython#8886]) but was observed to wedge the whole native USB
    stack (board vanishes from the bus) after YubiKey unplug/replug cycles.
    Revisit when 11.x reaches beta/stable.
-2. Copy the sources to the CIRCUITPY drive:
-
-   ```bash
-   cp src/boot.py src/code.py /run/media/johnyan/CIRCUITPY/
-   cp src/lib/adafruit_usb_host_descriptors.py /run/media/johnyan/CIRCUITPY/lib/
-   ```
+2. Deploy the sources: `make deploy` (boot.py, code.py and lib/ to CIRCUITPY;
+   after a fresh flash also run `make reset` so boot.py takes effect).
 3. **Hard-reset the Pico** (replug or `microcontroller.reset()`), then plug
    the YubiKey in once the LED is blinking (10.3.1 misses a device attached
    around host init; hot-plug after boot is reliable).
@@ -51,11 +47,27 @@ if you need them.
    sudo udevadm control --reload-rules && sudo udevadm trigger
    ```
 
-5. Verify: `python3 test/test_ctaphid.py` → should print INIT + PING ok.
+5. Verify: `make test` → should print INIT + PING ok (or `make e2e` for the
+   full deploy-reload-verify pipeline).
 
-To redeploy code changes: `cp src/code.py /run/media/johnyan/CIRCUITPY/ && sync`
-(auto-reload restarts it) or use `python3 test/e2e_test.py` (optionally
-`python3 test/e2e_test.py src/code_debug.py` for a traced run).
+## Make targets
+
+| Target | Purpose |
+|---|---|
+| `make deploy` | Copy `src/boot.py`, `src/code.py`, `src/lib/` to CIRCUITPY (code auto-reloads) |
+| `make deploy-debug` | Deploy the tracing build as code.py (packet-header logging — see warning) |
+| `make reset` | Hard-reset the board; applies boot.py changes, GP5 re-attaches the YubiKey |
+| `make download [VERSION=10.3.1]` | Fetch a CircuitPython uf2 image (git-ignored) |
+| `make flash UF2=<file>` | Flash firmware (Pico in BOOTSEL mode; RPI-RP2 drive must be mounted) |
+| `make test` | Host-side CTAPHID verification against the running relay |
+| `make e2e` | Full pipeline: deploy production code, soft-reload, verify, capture the relay log |
+| `make check` / `make debug` | Verify / regenerate code_debug.py |
+| `make log SECS=15` | Passively listen to the relay serial console |
+| `make clean` | Remove Python cache dirs |
+
+Redeploy code changes with `make deploy`; for a traced run use
+`make deploy-debug` (logs packet headers to the serial console) and
+restore production code afterwards with `make deploy`.
 
 [circuitpython#8886]: https://github.com/adafruit/circuitpython/issues/8886
 
