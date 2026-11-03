@@ -1,0 +1,6 @@
+# Raspberry Pi Pico (CircuitPython, 239a:80f4) YubiKey relay
+# Grant the seated user access to its hidraw nodes (CTAPHID for WebAuthn).
+# NOTE: 239a:80f4 is the stock CircuitPython PID for every Raspberry Pi
+# Pico, so this rule matches any CircuitPython Pico, not just this relay.
+# Install to /etc/udev/rules.d/ and reload udev (see README).
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="239a", ATTRS{idProduct}=="80f4", MODE="0660", TAG+="uaccess"

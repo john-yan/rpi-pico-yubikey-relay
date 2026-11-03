@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local agent/tooling state (machine-specific paths inside)
+.pi/
+
+# Editor / OS
+*.swp
+.DS_Store
+
+# Firmware images (kept locally, not tracked)
+*.uf2
