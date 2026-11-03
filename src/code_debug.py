@@ -38,6 +38,8 @@ SUBCLASS_BOOT = 0x01
 KBD_REPORT_LEN = 8
 CTAP_REPORT_LEN = 64
 ATTACH_TIMEOUT = 5.0  # seconds before power-cycling the downstream device
+AUTO_TOUCH_DELAY = 3.0  # seconds of touch-wait before simulating the finger
+AUTO_TOUCH_HOLD = 3.0  # seconds to hold the simulated touch
 
 # Downstream device allowlist: only Yubico security keys are relayed.
 # The upstream identity is always the Pico regardless of what answers
@@ -56,6 +58,13 @@ ALLOWED_VIDS = (0x1050,)
 # host port is initialized.
 power = digitalio.DigitalInOut(board.GP5)
 power.direction = digitalio.Direction.OUTPUT
+
+# GP15 drives the YubiKey's touch input: low = touch active, high = none.
+# Held high from boot (and the key is unpowered until GP5 enables it), so
+# the key never sees a phantom touch while the firmware boots.
+sim_touch = digitalio.DigitalInOut(board.GP15)
+sim_touch.direction = digitalio.Direction.OUTPUT
+sim_touch.value = True
 
 
 def yubikey_power(on):
@@ -256,6 +265,8 @@ while True:
         pending_conts = 0  # CONT packets the host still owes for this message
         resp_pending = 0  # CONT packets the YubiKey still owes for its response
         touch_pending = False  # KEEPALIVE reports the key awaits a finger
+        touch_phase = 0  # auto-touch: 0 idle, 1 countdown, 2 touching, 3 done
+        touch_start = 0.0  # monotonic time of the first waiting KEEPALIVE
         read_ms = IDLE_MS
         read_errors = 0  # consecutive spurious USBErrors on downstream reads
 
@@ -317,9 +328,14 @@ while True:
                     # a KEEPALIVE (cmd 0x3B -> 0xBB on the wire) with status
                     # 0x02 means the key is waiting for user presence; any
                     # other response packet means the ceremony was answered
-                    # (or cancelled).
+                    # (or cancelled). The first status-2 KEEPALIVE arms the
+                    # auto-touch timer; only a response clears it, so a stray
+                    # "processing" keepalive cannot restart the countdown.
                     if cmd_byte == 0xBB:
-                        touch_pending = ctap_buf[7] == 2
+                        if ctap_buf[7] == 2 and not touch_pending:
+                            touch_pending = True
+                            touch_phase = 1
+                            touch_start = time.monotonic()
                     elif cmd_byte & 0x80:
                         touch_pending = False
                     # stay open only while response CONTs are still due;
@@ -336,6 +352,29 @@ while True:
                     for i in range(n, KBD_REPORT_LEN):
                         kbd_buf[i] = 0
                     kbd_upstream.send_report(kbd_buf)
+
+            # Auto-touch: once the key has waited AUTO_TOUCH_DELAY seconds,
+            # simulate the finger for AUTO_TOUCH_HOLD seconds. One shot per
+            # ceremony; a physical touch still works at any time. The hold
+            # always runs its full course, even when the ceremony completes
+            # early (the response clears touch_pending, but GP15 stays low
+            # until AUTO_TOUCH_HOLD has elapsed).
+            if touch_phase == 2:
+                if (
+                    time.monotonic() - touch_start
+                    >= AUTO_TOUCH_DELAY + AUTO_TOUCH_HOLD
+                ):
+                    sim_touch.value = True  # finger off
+                    touch_phase = 0
+            elif touch_pending:
+                if (
+                    touch_phase == 1
+                    and time.monotonic() - touch_start >= AUTO_TOUCH_DELAY
+                ):
+                    sim_touch.value = False  # finger on
+                    touch_phase = 2
+            else:
+                touch_phase = 0  # ceremony over: re-arm for the next one
 
             # LED: solid = relaying, fast blink (~8 Hz) = waiting for touch.
             # Wall-clock based, so the poll loop is never blocked.

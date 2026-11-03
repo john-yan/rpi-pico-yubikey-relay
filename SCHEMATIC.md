@@ -32,6 +32,7 @@ reports); Pico ⇄ YubiKey over GPIO bit-banged USB (PIO host). The YubiKey's
 | GND | 38 (any GND) | breakout **GND** | common ground |
 | VBUS | 40 | Q2 emitter, R2 | unswitched 5 V from the PC's USB port |
 | GP5 | 7 | R1 → Q1 base | power-switch control (high = YubiKey on) |
+| GP15 | 20 | YubiKey touch input | low = touch active, high = inactive; auto-touch (see below) |
 | GP25 | onboard LED | — | status only: blink = waiting, solid = relaying |
 
 ## Power switch (GP5 → YubiKey 5 V)
@@ -95,6 +96,16 @@ The floating-off row is the design's key property: the YubiKey is unpowered
 until `code.py` drives GP5 high *after* the USB host port is initialized,
 which sidesteps [circuitpython#8886] (device attached around host init is
 never enumerated) and lets the firmware power-cycle the device to self-heal.
+
+## Auto-touch (GP15)
+
+GP15 is wired to the YubiKey's capacitive touch input: **low = touch
+active, high = none**. When a CTAP2 ceremony starts waiting for user
+presence (KEEPALIVE status 0x02), the firmware waits 3 s, drives GP15 low
+for 3 s (simulating the finger), then releases it. One shot per ceremony;
+a physical touch still works at any time. Note this makes ceremonies
+auto-approve on this relay - user presence becomes a 3-second delay, not a
+human check.
 
 ## Cautions
 
