@@ -32,7 +32,7 @@ reports); Pico ⇄ YubiKey over GPIO bit-banged USB (PIO host). The YubiKey's
 | GND | 38 (any GND) | breakout **GND** | common ground |
 | VBUS | 40 | Q2 emitter, R2 | unswitched 5 V from the PC's USB port |
 | GP5 | 7 | R1 → Q1 base | power-switch control (high = YubiKey on) |
-| GP15 | 20 | YubiKey touch input | low = touch active, high = inactive; auto-touch (see below) |
+| GP15 | 20 | relay board IN (active-low) | touch emulation: low = finger present (see Auto-touch) |
 | GP25 | onboard LED | — | status only: blink = waiting, solid = relaying |
 
 ## Power switch (GP5 → YubiKey 5 V)
@@ -99,13 +99,35 @@ never enumerated) and lets the firmware power-cycle the device to self-heal.
 
 ## Auto-touch (GP15)
 
-GP15 is wired to the YubiKey's capacitive touch input: **low = touch
-active, high = none**. When a CTAP2 ceremony starts waiting for user
-presence (KEEPALIVE status 0x02), the firmware waits 3 s, drives GP15 low
-for 3 s (simulating the finger), then releases it. One shot per ceremony;
-a physical touch still works at any time. Note this makes ceremonies
-auto-approve on this relay - user presence becomes a 3-second delay, not a
-human check.
+GP15 controls an external solenoid relay board whose switched contact
+connects the YubiKey's touch pad to a 10 µF capacitor tied to GND. The
+board's input is **active-low** (GP15 low = contact closed = touch
+active; high = open = released). When a CTAP2 ceremony starts waiting for
+user presence (KEEPALIVE status 0x02), the firmware waits 3 s, drives GP15
+low for 3 s (simulating the finger), then releases it. One shot per
+ceremony; a physical touch still works at any time. Note this makes
+ceremonies auto-approve on this relay - user presence becomes a 3-second
+delay, not a human check.
+
+```
+                          ┌─────────────────────┐
+   GP15 (pin 20) ──► IN ──┤   solenoid relay    │
+                          │   board             │
+                          │  (active-low IN:    │
+                          │   IN low = contact  │
+                          │   closed)           │
+                          │                  T1 ├────► YubiKey touch pad
+                          │                  T2 ├──┐
+                          └─────────────────────┘  │
+                                                [C1 10 µF]
+                                                    │
+                                                   GND
+```
+
+A finger on the pad reads as capacitance to ground. While the relay is
+disengaged (GP15 high), the contact is open and the pad is left
+untouched - C1 is disconnected. When the relay engages, the pad connects
+to C1 (10 µF to GND), presenting the capacitive signature of a finger.
 
 ## Cautions
 
