@@ -9,6 +9,9 @@ relaying FIDO2/WebAuthn traffic (and optionally OTP keystrokes) transparently.
           HID device to the PC)         this code.py)                          token)
 ```
 
+Full wiring — pinout, the GP5 dual-transistor power switch, and assembly
+cautions — is in [SCHEMATIC.md](SCHEMATIC.md).
+
 ## Files
 
 | File | Purpose |
@@ -21,6 +24,7 @@ relaying FIDO2/WebAuthn traffic (and optionally OTP keystrokes) transparently.
 | `test/test_ctaphid.py` | Host-side verification: CTAPHID INIT + multi-packet PING through the relay |
 | `test/e2e_test.py` | Deploys code (default: production `src/code.py`), reloads the board, runs CTAPHID INIT/PING checks (helpers imported from `test_ctaphid.py`), captures the relay log |
 | `utils/read_repl.py` / `utils/send_repl.py` / `utils/listen_repl.py` | Serial console helpers for /dev/ttyACM0 |
+| `SCHEMATIC.md` | Connection schematic: pinout, power-switch circuit, cautions |
 | `70-pico-yubikey-relay.rules` | udev rule so browsers/tests can access the relay's hidraw node |
 Firmware images (`circuitpython-pico-*.uf2`) are git-ignored; fetch the
 pinned version with `make download` (or another via
@@ -73,7 +77,8 @@ restore production code afterwards with `make deploy`.
   caused enumeration timeouts and may have contributed to a firmware crash
   that left the board unreachable until a cold power cycle.
 - **Downstream 5V is switched by GP5** through a dual-transistor high-side
-  switch (NPN driver + PN2907A). The pin floats at boot and during flashing,
+  switch (NPN driver + PN2907A; circuit and values in
+  [SCHEMATIC.md](SCHEMATIC.md)). The pin floats at boot and during flashing,
   so the YubiKey is unpowered until code.py enables it after the USB host
   port is initialized - this sidesteps the CircuitPython cold-boot bug
   (#8886) and lets the firmware power-cycle the device to self-heal.
