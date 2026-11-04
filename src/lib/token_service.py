@@ -83,8 +83,15 @@ class TokenService:
         """Non-blocking: drain the CDC port, handle commands, check timeouts."""
         now = time.monotonic()
         if self.state != IDLE and now > self.deadline:
-            self._reply({"c": "BROKERED", "e": "timeout"})
+            timed_out_init = self.state == INIT_SENT
             self.state = IDLE
+            if timed_out_init:
+                # Channel-INIT allocation timed out: reply WELCOME-type so the
+                # daemon's hello() fails cleanly instead of discarding a
+                # stale BROKERED line that a later cmd() could mis-consume.
+                self._reply({"c": "WELCOME", "e": self.epoch, "e2": "timeout"})
+            else:
+                self._reply({"c": "BROKERED", "e": "timeout"})
         port = self.port
         if port is None:
             return
@@ -112,9 +119,14 @@ class TokenService:
 
         Called by the main loop for EVERY 64-byte packet from the key,
         before any relay handling: broker traffic must never reach the PC
-        or the touch state machine.
+        or the touch state machine. The private-cid filter is NOT gated on
+        the broker state - a timed-out or lost exchange drops state to IDLE
+        while the channel lives on, and late strays leaking into the
+        verbatim upstream path block send_report (2 s per packet with no
+        host reader) and tear the session down (the bug class fixed after
+        the phase-4 refactor).
         """
-        if self.state == IDLE or self.sender is None:
+        if self.sender is None:
             return False
         cid = (pkt[0] << 24) | (pkt[1] << 16) | (pkt[2] << 8) | pkt[3]
         if self.state == INIT_SENT:
@@ -130,26 +142,42 @@ class TokenService:
                 {"c": "WELCOME", "e": self.epoch, "t": self.token is not None}
             )
             return True
-        # WAITING: everything on our private channel is ours
-        if cid != self.cid:
-            return False
-        if pkt[4] == 0xBB:  # keepalive on our channel: ignore, keep waiting
-            return True
-        if pkt[4] == 0xBF:  # CTAPHID error: end the exchange with it
+        if self.state == WAITING:
+            # everything on our private channel is ours
+            if cid != self.cid:
+                return False
+            if pkt[4] == 0xBB:  # keepalive on our channel: ignore, keep waiting
+                return True
+            if pkt[4] == 0xBF:  # CTAPHID error: end the exchange with it
+                self.state = IDLE
+                self._reply({"c": "BROKERED", "e": "ctaphid-{:02x}".format(pkt[7])})
+                return True
+            r = self.asm.feed(pkt)
+            if r is None:
+                return True  # response still accumulating
+            if r is ctaphid_proxy.BYPASS:
+                self.state = IDLE
+                self._reply({"c": "BROKERED", "e": "bypass"})
+                return True
+            _, msg = r
             self.state = IDLE
-            self._reply({"c": "BROKERED", "e": "ctaphid-{:02x}".format(pkt[7])})
+            self._reply({"c": "BROKERED", "h": msg.hex()})
             return True
-        r = self.asm.feed(pkt)
-        if r is None:
-            return True  # response still accumulating
-        if r is ctaphid_proxy.BYPASS:
-            self.state = IDLE
-            self._reply({"c": "BROKERED", "e": "bypass"})
+        # IDLE: blackhole anything that still belongs to us - late strays
+        # of a timed-out or corrupted exchange (same leak class as above),
+        # and a late INIT response for an allocation that already timed out
+        # (it is on the broadcast cid and matches our nonce, so it cannot
+        # be the PC's).
+        if self.cid and cid == self.cid:
             return True
-        _, msg = r
-        self.state = IDLE
-        self._reply({"c": "BROKERED", "h": msg.hex()})
-        return True
+        if (
+            self.nonce
+            and cid == 0xFFFFFFFF
+            and pkt[4] == 0x86
+            and bytes(pkt[7:15]) == self.nonce
+        ):
+            return True
+        return False
 
     # ---- CDC command handling --------------------------------------------
 

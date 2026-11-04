@@ -59,6 +59,12 @@ reset: ## Hard-reset the board (applies boot.py changes; GP5 re-attaches YubiKey
 test: ## Run the host-side CTAPHID verification (no deploy)
 	python3 test/test_ctaphid.py
 
+unit: ## Run the host-side unit tests (no hardware needed)
+	python3 test/test_persona.py
+	python3 test/test_injector.py
+	python3 test/test_ctaphid_proxy.py
+	python3 test/test_token_service.py
+
 e2e: ## Full pipeline: deploy production code, soft-reload, verify, capture log
 	python3 test/e2e_test.py
 

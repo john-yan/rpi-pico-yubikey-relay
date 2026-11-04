@@ -267,6 +267,13 @@ AUTOUV = True
 # shape); "always" injects on every makeCredential/getAssertion.
 UV_POLICY = "follow"
 
+# Injector RP-ID allowlist (plan.md §6, review finding): when non-empty,
+# pinUvAuthParam injection only happens for these RP IDs - everything else
+# degrades to touch-only (UV=false). The token itself cannot be scoped on
+# this firmware (fw 5.4.3 rejects scoped tokens, phase-0 P2b), so this is the
+# only rpId-level restriction available. Empty tuple = inject for any RP.
+UV_RPIDS = ()
+
 # Phase-3 token service (plan.md §5.4): the persona is gated on a live
 # pinUvAuthToken pushed by the host daemon over the CDC data port — the
 # PIN itself never leaves the host. Daemon absent/expired -> persona off
@@ -301,45 +308,60 @@ def _ring_dump(reason):
     _ring.clear()
 
 
+def _cid_of(pkt):
+    return (pkt[0] << 24) | (pkt[1] << 16) | (pkt[2] << 8) | pkt[3]
+
+
 def cbor_request_hook(cid, message):
     """PC -> YubiKey CTAP2 message (command byte + CBOR, e.g. 0x04=GetInfo)."""
     if AUTOUV and message:
         if len(_pending_req) > 32:
             _pending_req.clear()  # CTAPHID channels are never closed; cap growth
         _pending_req[cid] = message[0]
-        if token_svc.active() and message[0] in (
+        if message[0] in (
             injector.CTAP2_MAKE_CREDENTIAL,
             injector.CTAP2_GET_ASSERTION,
         ):
-            # Phase-4 injector: strip options.uv and splice a genuine
-            # pinUvAuthParam so the key performs PIN-based UV while the
-            # PC still believes it talked to a biometric key.
+            # mc/ga always run through the injector while AUTOUV is on:
+            # with a live token it splices pinUvAuthParam (genuine UV);
+            # without one it still strips options.uv so persona-shaped
+            # requests degrade to touch-only instead of the key rejecting
+            # them with UNSUPPORTED_OPTION (graceful daemon-outage path).
             new_msg, injected = injector.inject(
-                message, token_svc.token, token_svc.token_proto, UV_POLICY
+                message,
+                token_svc.token,
+                token_svc.token_proto,
+                UV_POLICY,
+                UV_RPIDS,
             )
             if injected:
                 _ring_log("ij", message[:4])
                 return new_msg
+            if new_msg is not message:
+                return new_msg  # uv stripped, no injection
     return message
 
 
 def cbor_response_hook(cid, message):
     """YubiKey -> PC CTAP2 message (GetInfo, assertions, errors)."""
-    if AUTOUV and token_svc.active():
+    if AUTOUV:
+        # Always pop, even when the token gate is off mid-ceremony, so
+        # stale entries never accumulate to the 32-entry wipe.
         cmd = _pending_req.pop(cid, None)
-        if cmd == persona.CTAP2_GET_INFO:
-            return persona.rewrite_getinfo(message)
-        if (
-            cmd in (injector.CTAP2_MAKE_CREDENTIAL, injector.CTAP2_GET_ASSERTION)
-            and message
-            and message[0] == 0x33
-        ):
-            # PIN_AUTH_INVALID: our cached token went stale (e.g. PIN
-            # changed under us). Drop it; the daemon re-acquires on its
-            # next heartbeat (<=5s) and the persona falls back off until
-            # then. The affected ceremony fails visibly at the RP.
-            token_svc.token = None
-            print("token rejected (PIN_AUTH_INVALID) - dropped")
+        if token_svc.active():
+            if cmd == persona.CTAP2_GET_INFO:
+                return persona.rewrite_getinfo(message)
+            if (
+                cmd in (injector.CTAP2_MAKE_CREDENTIAL, injector.CTAP2_GET_ASSERTION)
+                and message
+                and message[0] == 0x33
+            ):
+                # PIN_AUTH_INVALID: our cached token went stale (e.g. PIN
+                # changed under us). Drop it; the daemon re-acquires on its
+                # next heartbeat (<=5s) and the persona falls back off until
+                # then. The affected ceremony fails visibly at the RP.
+                token_svc.token = None
+                print("token rejected (PIN_AUTH_INVALID) - dropped")
     return message
 
 
@@ -546,6 +568,7 @@ while True:
                         # leaking them (which surfaces as a confusing
                         # INVALID_COMMAND at the client).
                         _ring_dump("lost response packet - INVALID_SEQ sent")
+                        _pending_req.pop(_cid_of(ctap_buf), None)
                         drop_stray_conts = True
                         err = bytearray(CTAP_REPORT_LEN)
                         err[0] = ctap_buf[0]
@@ -560,6 +583,7 @@ while True:
                         brokered = True  # this CONT is part of the wreckage
                     if not brokered and cmd_byte == 0xBF:
                         _ring_dump("CTAPHID error from key")
+                        _pending_req.pop(_cid_of(ctap_buf), None)
                     handled = False
                     if not brokered and (
                         cmd_byte == CMD_CBOR
@@ -586,6 +610,7 @@ while True:
                             # assembly: a sibling CONT was lost mid-message.
                             # Same recovery as the orphan path above.
                             _ring_dump("lost mid-response CONT - INVALID_SEQ sent")
+                            _pending_req.pop(_cid_of(ctap_buf), None)
                             drop_stray_conts = True
                             err = bytearray(CTAP_REPORT_LEN)
                             err[0] = ctap_buf[0]

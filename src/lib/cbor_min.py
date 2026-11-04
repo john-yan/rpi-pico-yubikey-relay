@@ -18,6 +18,12 @@ MAJOR_MAP = 5
 MAJOR_TAG = 6
 MAJOR_SIMPLE = 7
 
+# Nesting cap: CTAP2 messages are shallow (<= 4 levels); anything deeper
+# is hostile input (a 2-bytes-per-level bomb inside the 4 KiB reassembly
+# window reaches ~2000 frames). Raise ValueError instead of risking stack
+# exhaustion on the Pico.
+MAX_DEPTH = 16
+
 
 def _read_head(data, i):
     """Return (major, value, next_index) for the item header at data[i]."""
@@ -44,7 +50,9 @@ def _read_head(data, i):
     raise ValueError("indefinite/reserved additional info")
 
 
-def _decode1(data, i):
+def _decode1(data, i, depth=0):
+    if depth > MAX_DEPTH:
+        raise ValueError("CBOR nesting too deep")
     major, val, i = _read_head(data, i)
     if major == MAJOR_UINT:
         return val, i
@@ -57,18 +65,18 @@ def _decode1(data, i):
     if major == MAJOR_ARRAY:
         out = []
         for _ in range(val):
-            v, i = _decode1(data, i)
+            v, i = _decode1(data, i, depth + 1)
             out.append(v)
         return out, i
     if major == MAJOR_MAP:
         out = {}
         for _ in range(val):
-            k, i = _decode1(data, i)
-            v, i = _decode1(data, i)
+            k, i = _decode1(data, i, depth + 1)
+            v, i = _decode1(data, i, depth + 1)
             out[k] = v
         return out, i
     if major == MAJOR_TAG:
-        v, i = _decode1(data, i)
+        v, i = _decode1(data, i, depth + 1)
         return v, i  # tags are not used by CTAP2; decode through
     if major == MAJOR_SIMPLE:
         if val == 20:

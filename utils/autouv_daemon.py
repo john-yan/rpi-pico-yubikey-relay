@@ -17,7 +17,7 @@ Usage:
 
     --once   acquire the token, push it, verify, exit (no heartbeat loop)
 
-PIN source (first found): --pin, PICO_RELAY_PIN env, .pin next to this
+PIN source (first found): PICO_RELAY_PIN env, .pin next to this
 script / in cwd / in the repo root, else getpass.
 
 Lockout safety (plan.md §5.4): getPinRetries is checked before every
@@ -57,19 +57,25 @@ ERR_PIN_AUTH_INVALID = 0x33
 HEARTBEAT_S = 5.0
 
 
-def read_pin(args):
-    if args.pin is not None:
-        return args.pin
+def read_pin(interactive_ok=True):
     env = os.environ.get("PICO_RELAY_PIN")
     if env:
         return env.strip()
     here = os.path.dirname(os.path.abspath(__file__))
     for p in (os.path.join(here, ".pin"), ".pin", os.path.join(here, "..", ".pin")):
         if os.path.isfile(p):
+            mode = os.stat(p).st_mode & 0o777
+            if mode & 0o077:
+                print(
+                    f"WARNING: {p} is mode {oct(mode)} - group/other can read "
+                    "your FIDO2 PIN. Fix with: chmod 600 {p}"
+                )
             with open(p) as f:
                 pin = f.read().strip()
             if pin:
                 return pin
+    if not interactive_ok:
+        return None
     return getpass.getpass("YubiKey FIDO2 PIN (input hidden): ")
 
 
@@ -84,7 +90,11 @@ class Relay:
 
     def _send(self, obj):
         if self.verbose:
-            print("->", obj)
+            safe = dict(obj)
+            if safe.get("c") == "SET_TOKEN":
+                # never log the token bytes (they are a live UV credential)
+                safe["h"] = "<redacted %dB>" % (len(safe.get("h", "")) // 2)
+            print("->", safe)
         self.ser.write(json.dumps(obj).encode("utf-8") + b"\n")
 
     def _readline(self, timeout):
@@ -254,13 +264,15 @@ def acquire_token(relay, pin):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", default="/dev/ttyACM1")
-    ap.add_argument("--pin", default=None, help="PIN (else env/.pin/getpass)")
     ap.add_argument("--once", action="store_true",
                     help="acquire and push the token, then exit")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
-    pin = read_pin(args)
+    # NOTE: no --pin flag on purpose - a PIN on the command line is
+    # readable by every local user via /proc/*/cmdline (plan.md §5.4).
+    # Use PICO_RELAY_PIN (environ is same-user-only), .pin, or getpass.
+    pin = read_pin()
     relay = Relay(args.port, verbose=args.verbose)
 
     print(f"connecting to relay on {args.port} ...")
@@ -282,8 +294,9 @@ def main():
     try:
         while True:
             time.sleep(HEARTBEAT_S)
+            epoch_before = relay.epoch
             r = relay.ping()
-            if r.get("e") != relay.epoch or not r.get("t"):
+            if r.get("e") != epoch_before or not r.get("t"):
                 print("key re-attached or token lost - re-acquiring")
                 relay.hello()  # re-allocate the private channel if needed
                 acquire_and_push()

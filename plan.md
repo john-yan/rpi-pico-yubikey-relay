@@ -1,7 +1,8 @@
 # plan.md — Auto-UV: PIN auto-entry in the Pico YubiKey relay
 
-**Status: DESIGN (not implemented). Feature-flagged; default OFF preserves the
-current transparent-pipe behavior.**
+**Status: IMPLEMENTED (phases 0–4 complete, 2026-11-04; phase 5 pending).
+Shipped with `AUTOUV = True` — the hooks are inert without a live
+daemon + token (see §11). Real-Chrome dry-run still pending (user).**
 
 ## 0. Goal
 
@@ -98,9 +99,10 @@ daemon reading hidraw3 would steal Chrome's response packets mid-ceremony.
 The CDC-brokered private channel is invisible to Chrome and deterministic.
 
 Security property of the split: **the PIN never touches the Pico flash.**
-The Pico holds only short-lived, permission-scoped tokens (invalidated on
-key power cycle or PIN change). PIN compromise surface = the host, same as
-any password manager.
+The Pico holds only the pinUvAuthToken — power-cycle-scoped, but **NOT
+permission-scoped** (fw 5.4.3 only supports the legacy unscoped getPinToken;
+phase-0 P2b — see the corrected §6). PIN compromise surface = the host,
+same as any password manager.
 
 ### Component map (per AGENTS.md roles)
 
@@ -248,19 +250,30 @@ What we give up / accept:
 1. **The PIN lives on the host** (daemon config/keyring) — same trust level
    as a password manager or the SSH agent. An attacker with the user's
    desktop session already owns the accounts anyway.
-2. **The Pico never stores the PIN** — only power-cycle-scoped,
-   permission-scoped tokens. Stealing the YubiKey alone still does *not*
-   yield UV (better than baking the PIN into the relay flash, which was
-   rejected).
+2. **The Pico never stores the PIN** — only the pinUvAuthToken, which is
+   power-cycle-scoped but **unscoped by permission and rpId** (a firmware
+   limitation: fw 5.4.3 rejects the CTAP2.1 scoped-token subcommand,
+   phase-0 P2b). Stealing the YubiKey alone still does *not* yield UV.
+   Consequence, stated plainly: while the daemon is live, ANY process in
+   the user's session can obtain UV=true assertions for any RP without
+   knowing the PIN (auto-touch supplies presence after 3 s). The optional
+   `UV_RPIDS` allowlist in code.py restricts injection to listed RP IDs;
+   empty (shipped default) allows all. This is the deliberate
+   convenience-for-assurance trade the user has chosen.
+   - CDC control-plane note (review finding): the ttyACM1 protocol is
+     unauthenticated and the Pico side has no lockout guard — but the same
+     local principals already have direct hidraw access to the key via the
+     udev rule, so the broker adds no new capability. Marginal risk
+     accepted and documented rather than mitigated.
 3. **RP-visible UV remains truthful at the protocol level**: the YubiKey
    itself verifies the HMAC and sets the flag. What changes is *who typed
    the PIN and when* (once, at provisioning) — equivalent semantics to a
    remembered password, but RPs that treat UV as "fresh proof of the
    PIN-holder" see it as such per ceremony. This is the deliberate
    convenience-for-assurance trade the user has chosen.
-4. **Relay compromise**: malicious Pico code could use live tokens within
-   their rpId/permission scope while powered. Bounded by token invalidation
-   at power cycle; the Pico never gains PIN knowledge.
+4. **Relay compromise**: malicious Pico code could use the live (unscoped)
+   token for any RP while powered. Bounded by token invalidation at power
+   cycle; the Pico never gains PIN knowledge.
 5. **Downgrade is graceful**: unplug the daemon → persona off → Chrome
    prompts for the PIN again as today. No data is destroyed by disabling.
 
@@ -406,9 +419,13 @@ genuine UV=true assertion from the key through the relay.**
 
 ## 11. Rollout & rollback
 
-- All new behavior behind `AUTOUV = False` default in `code.py`.
-- Daemon is additive (`utils/`), no existing file's raw-relay logic changes
-  when the flag is off.
+- `AUTOUV = True` ships in code.py; the persona and injector hooks are
+  gated on a live daemon + token (`token_svc.active()`), so with the daemon
+  stopped the relay behaves exactly like the pre-Auto-UV pipe for FIDO2.
+  Note the CTAPHID message-layer proxy, orphan detectors and
+  INVALID_SEQ recovery run unconditionally (they are the relay's core
+  now, not Auto-UV features).
+- Daemon is additive (`utils/`).
 - Rollback = flash previous `code.py` (git revert); the YubiKey itself is
   never modified (no reset, no PIN change, no new credentials).
 
