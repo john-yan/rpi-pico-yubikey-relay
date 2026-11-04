@@ -32,6 +32,7 @@ import usb_hid
 
 import adafruit_usb_host_descriptors
 import ctaphid_proxy
+import persona
 
 DIR_IN = 0x80
 CLASS_HID = 0x03
@@ -243,19 +244,64 @@ def conts_expected(bcnt):
 # ------------------------------------------------- CTAP2 message hooks
 # The message-layer proxy (plan.md §5.1) reassembles CTAPHID CBOR (0x90)
 # messages in both directions and hands complete messages to these hooks
-# before re-packetizing. Phase 1: identity passes, keeping the relay
-# byte-identical to the raw pipe. Later phases install the persona
-# (GetInfo rewrite, §5.2) into cbor_response_hook and the injector
-# (pinUvAuthParam splice, §5.3) into cbor_request_hook.
+# before re-packetizing.
+#
+# Auto-UV master switch (plan.md). Phase 2: the GetInfo persona is
+# always on when True. Phase 3 will gate this on the daemon holding a
+# live pinUvAuthToken instead (safe fallback: persona off -> normal
+# Chrome PIN prompts).
+#
+# PERSONA EFFECT (plan.md §5.2): GetInfo responses are rewritten so the
+# host sees a biometric key - clientPin removed, uv:true added. Chrome
+# then never shows a PIN dialog and sends options {uv:true} with no
+# pinUvAuthParam; until the phase-4 injector exists, the real key
+# rejects that option (UNSUPPORTED_OPTION) on UV-required / discoverable
+# flows, while UV-preferred flows work touch-only (UV=false).
+AUTOUV = True
+
+_pending_req = {}  # cid -> CTAP2 command byte of the outstanding request
+
+# Rolling diagnostics (plan.md §7 fault forensics): raw packet headers are
+# captured to a bounded in-memory ring at ~zero timing cost, and dumped to
+# the console on anomaly signatures (orphaned CONT packets, CTAPHID errors,
+# fault-handler entry). Prints per packet would perturb the very races
+# being hunted, so the ring stores bytes and formats only on dump.
+_ring = []
+_RING_MAX = 48
+
+
+def _ring_log(tag, pkt):
+    if len(_ring) >= _RING_MAX:
+        _ring.pop(0)
+    _ring.append((tag, bytes(pkt[4:8])))
+
+
+def _ring_dump(reason):
+    print("DIAG:", reason)
+    for tag, b in _ring:
+        print(
+            "  ",
+            tag,
+            " ".join("{:02x}".format(x) for x in b),
+        )
+    _ring.clear()
 
 
 def cbor_request_hook(cid, message):
     """PC -> YubiKey CTAP2 message (command byte + CBOR, e.g. 0x04=GetInfo)."""
+    if AUTOUV and message:
+        if len(_pending_req) > 32:
+            _pending_req.clear()  # CTAPHID channels are never closed; cap growth
+        _pending_req[cid] = message[0]
     return message
 
 
 def cbor_response_hook(cid, message):
     """YubiKey -> PC CTAP2 message (GetInfo, assertions, errors)."""
+    if AUTOUV:
+        cmd = _pending_req.pop(cid, None)
+        if cmd == persona.CTAP2_GET_INFO:
+            return persona.rewrite_getinfo(message)
     return message
 
 
@@ -287,6 +333,7 @@ while True:
         # upstream (verbatim relays and proxy re-emissions alike); the
         # tracing build (make_debug.py) instruments exactly these two.
         def send_downstream(pkt):
+            _ring_log("F>", pkt)
             # A transient NAK/stall on the PIO bus can make dev.write raise
             # an empty-message USBError (observed on proxy re-emission
             # bursts); tearing the session down for it kills in-flight
@@ -305,6 +352,7 @@ while True:
                     time.sleep(0.01)
 
         def send_upstream(pkt):
+            _ring_log("Y>", pkt)
             last_op[0] = "send_up"
             try:
                 ctap_send(pkt)
@@ -341,6 +389,14 @@ while True:
                     if report is None:
                         break
                     cmd_byte = report[4]
+                    _ring_log(">", report)
+                    if not cmd_byte & 0x80 and not req_asm.active and not pending_conts:
+                        # Orphaned host CONT: the PC is streaming a request
+                        # continuation with no assembly and no verbatim
+                        # message pending - an INIT was lost (only-latest OUT
+                        # buffer). The key would then wait forever on a
+                        # truncated request.
+                        _ring_dump("orphan request CONT")
                     handled = False
                     if cmd_byte == CMD_CBOR or (
                         req_asm.active and not cmd_byte & 0x80
@@ -401,7 +457,19 @@ while True:
                 # Interrupt IN packets are atomic: only ever forward full
                 # 64-byte reports, never a short read padded with stale bytes.
                 if n == CTAP_REPORT_LEN:
+                    print("YK>>:", " ".join("{:02x}".format(ctap_buf[i]) for i in range(8)))
                     cmd_byte = ctap_buf[4]
+                    _ring_log("<", ctap_buf)
+                    if not cmd_byte & 0x80 and not resp_asm.active and not resp_pending:
+                        # Orphaned CONT: the key is streaming a continuation
+                        # with no response assembly in progress and no
+                        # verbatim message pending either - the INIT packet
+                        # was lost or consumed elsewhere. This is the
+                        # signature of the dropped-response race (run-6
+                        # forensics); dump everything we saw.
+                        _ring_dump("orphan response CONT")
+                    if cmd_byte == 0xBF:
+                        _ring_dump("CTAPHID error from key")
                     handled = False
                     if cmd_byte == CMD_CBOR or (
                         resp_asm.active and not cmd_byte & 0x80
@@ -513,6 +581,7 @@ while True:
             sys.print_exception(e)  # full traceback (str(e) is often empty)
         except Exception:
             pass
+        _ring_dump("fault at " + last_op[0])
         print("relay error at", last_op[0], ":", e, "- re-enumerating")
         if teardowns >= 3:
             print("repeated faults - power-cycling YubiKey")

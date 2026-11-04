@@ -25,19 +25,27 @@ TRACE_YK_TO_HOST = '''            try:
                 ctap_send(pkt)
                 print("Y>PC:", " ".join("{:02x}".format(b) for b in pkt[:8]))'''
 
+TRACE_YK_ARRIVAL = '''                if n == CTAP_REPORT_LEN:
+                    print("YK>>:", " ".join("{:02x}".format(ctap_buf[i]) for i in range(8)))
+                    cmd_byte = ctap_buf[4]'''
+
 ANCHOR_HOST_TO_YK = '''                    ctap_write(ctap_out, pkt, timeout=100)'''
 
 ANCHOR_YK_TO_HOST = '''            try:
                 ctap_send(pkt)'''
 
+ANCHOR_YK_ARRIVAL = '''                if n == CTAP_REPORT_LEN:
+                    cmd_byte = ctap_buf[4]'''
+
 
 def build():
     src = open(os.path.join(SRC_DIR, "code.py")).read()
-    for anchor in (ANCHOR_HOST_TO_YK, ANCHOR_YK_TO_HOST):
+    for anchor in (ANCHOR_HOST_TO_YK, ANCHOR_YK_TO_HOST, ANCHOR_YK_ARRIVAL):
         if src.count(anchor) != 1:
             sys.exit(f"error: anchor not found exactly once in code.py:\n{anchor!r}")
     src = src.replace(ANCHOR_HOST_TO_YK, TRACE_HOST_TO_YK)
     src = src.replace(ANCHOR_YK_TO_HOST, TRACE_YK_TO_HOST)
+    src = src.replace(ANCHOR_YK_ARRIVAL, TRACE_YK_ARRIVAL)
     return src
 
 

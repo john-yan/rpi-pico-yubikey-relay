@@ -278,13 +278,27 @@ What we give up / accept:
 
 ## 8. Phased implementation (each phase independently testable)
 
-- **Phase 1 — Proxy refactor.** CTAPHID reassembly/re-packetization with
-  hooks, behavior-identical. Verify: `make test` (INIT+PING) passes,
-  `test/e2e_test.py` passes, Chrome login works unchanged.
-- **Phase 2 — Persona.** GetInfo rewriter behind `AUTOUV_PERSONA=True`,
-  daemon stub that only does HELLO/HEARTBEAT. Verify in Chrome: no PIN
-  dialog on `webauthn.io` (preferred), touch-only login works, UV flag
-  false (expected, no injector yet); UV-required demo site fails gracefully.
+- **Phase 1 — Proxy refactor. DONE (2025-11-04).** CTAPHID reassembly/
+  re-packetization with hooks, behavior-identical. Verified: make test,
+  make e2e, GetInfo and full CTAP2 ceremonies (UV=true) through the proxy,
+  10/10 unattended luci reauth. Hardening added during verification:
+  send_downstream retry (transient PIO NAK/stall was tearing down sessions
+  — the user's original ~75% luci failure), send_upstream retry, auto-touch
+  arm race fix, fault attribution, diagnostic ring buffer.
+- **Phase 2 — Persona. DONE (2025-11-04).** cbor_min (canonical CTAP2
+  CBOR — map keys length-first sorted; MicroPython dicts iterate in hash
+  order, so explicit sorting is mandatory; python-fido2 rejects
+  non-canonical responses) + persona.py (GetInfo rewrite, fail-open) +
+  AUTOUV flag and request-tracking hooks in code.py. Verified on-device:
+  GetInfo through the relay reports uv:true with clientPin removed;
+  python-fido2 1.2.0 and 2.0.0 clients accept the rewritten response;
+  luci reauth 43/43 through the persona. Chrome dry-run pending (user).
+  Known-open: two early occurrences of a dropped response-INIT re-emission
+  (client saw orphaned CONTs -> INVALID_COMMAND), not reproduced in 43
+  subsequent runs; the diagnostic ring + orphan-CONT detectors stay
+  deployed to capture it if it recurs. Expected until phase 4: UV-required
+  and discoverable/passkey flows fail (the key rejects options uv:true —
+  UNSUPPORTED_OPTION); UV-preferred flows work touch-only with UV=false.
 - **Phase 3 — Token service.** Daemon + broker + PIN dance + lockout guard.
   Verify: daemon logs token acquisition; Pico caches; wrong-PIN path
   disables cleanly with retries counter intact (`getPinRetries` before/
