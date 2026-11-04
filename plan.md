@@ -256,7 +256,7 @@ What we give up / accept:
    phase-0 P2b). Stealing the YubiKey alone still does *not* yield UV.
    Consequence, stated plainly: while the daemon is live, ANY process in
    the user's session can obtain UV=true assertions for any RP without
-   knowing the PIN (auto-touch supplies presence after 3 s). The optional
+   knowing the PIN (auto-touch supplies presence after 1 s). The optional
    `UV_RPIDS` allowlist in code.py restricts injection to listed RP IDs;
    empty (shipped default) allows all. This is the deliberate
    convenience-for-assurance trade the user has chosen.

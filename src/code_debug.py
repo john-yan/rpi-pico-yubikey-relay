@@ -44,7 +44,7 @@ KBD_REPORT_LEN = 8
 CTAP_REPORT_LEN = 64
 CMD_CBOR = ctaphid_proxy.CMD_CBOR  # CTAPHID wire command for CTAP2/CBOR
 ATTACH_TIMEOUT = 5.0  # seconds before power-cycling the downstream device
-AUTO_TOUCH_DELAY = 3.0  # seconds of touch-wait before simulating the finger
+AUTO_TOUCH_DELAY = 1.0  # seconds of touch-wait before simulating the finger
 AUTO_TOUCH_HOLD = 1.0  # seconds to hold the simulated touch
 
 # Downstream device allowlist: only Yubico security keys are relayed.
