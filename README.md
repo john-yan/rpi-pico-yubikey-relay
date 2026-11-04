@@ -21,6 +21,8 @@ cautions — is in [SCHEMATIC.md](SCHEMATIC.md).
 | `src/code_debug.py` | Generated: code.py + packet tracing. Regenerate with `python3 src/make_debug.py`. **Warning:** logs the first 8 bytes of every CTAPHID packet to the serial console — don't leave it deployed |
 | `src/make_debug.py` | Generator for code_debug.py (`--check` verifies it is current) |
 | `src/lib/adafruit_usb_host_descriptors.py` | Descriptor parsing helper. **Deploy to CIRCUITPY/lib.** |
+| `src/lib/ctaphid_proxy.py` | CTAPHID message-layer proxy: reassembles CTAP2/CBOR (`0x90`) messages and re-packetizes them through the identity hooks in `code.py` (Auto-UV phases 2–4 install the persona/injector there). **Deploy to CIRCUITPY/lib.** |
+| `plan.md` | Design doc: Auto-UV (PIN auto-entry) — architecture, verified spec facts (phase-0 probes), phased implementation plan |
 | `test/test_ctaphid.py` | Host-side verification: CTAPHID INIT + multi-packet PING through the relay |
 | `test/e2e_test.py` | Deploys code (default: production `src/code.py`), reloads the board, runs CTAPHID INIT/PING checks (helpers imported from `test_ctaphid.py`), captures the relay log |
 | `utils/read_repl.py` / `utils/send_repl.py` / `utils/listen_repl.py` | Serial console helpers for /dev/ttyACM0 |

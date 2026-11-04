@@ -31,15 +31,17 @@ import usb.core
 import usb_hid
 
 import adafruit_usb_host_descriptors
+import ctaphid_proxy
 
 DIR_IN = 0x80
 CLASS_HID = 0x03
 SUBCLASS_BOOT = 0x01
 KBD_REPORT_LEN = 8
 CTAP_REPORT_LEN = 64
+CMD_CBOR = ctaphid_proxy.CMD_CBOR  # CTAPHID wire command for CTAP2/CBOR
 ATTACH_TIMEOUT = 5.0  # seconds before power-cycling the downstream device
 AUTO_TOUCH_DELAY = 3.0  # seconds of touch-wait before simulating the finger
-AUTO_TOUCH_HOLD = 3.0  # seconds to hold the simulated touch
+AUTO_TOUCH_HOLD = 1.0  # seconds to hold the simulated touch
 
 # Downstream device allowlist: only Yubico security keys are relayed.
 # The upstream identity is always the Pico regardless of what answers
@@ -238,6 +240,25 @@ def conts_expected(bcnt):
     return (rest + CONT_DATA_MAX - 1) // CONT_DATA_MAX
 
 
+# ------------------------------------------------- CTAP2 message hooks
+# The message-layer proxy (plan.md §5.1) reassembles CTAPHID CBOR (0x90)
+# messages in both directions and hands complete messages to these hooks
+# before re-packetizing. Phase 1: identity passes, keeping the relay
+# byte-identical to the raw pipe. Later phases install the persona
+# (GetInfo rewrite, §5.2) into cbor_response_hook and the injector
+# (pinUvAuthParam splice, §5.3) into cbor_request_hook.
+
+
+def cbor_request_hook(cid, message):
+    """PC -> YubiKey CTAP2 message (command byte + CBOR, e.g. 0x04=GetInfo)."""
+    return message
+
+
+def cbor_response_hook(cid, message):
+    """YubiKey -> PC CTAP2 message (GetInfo, assertions, errors)."""
+    return message
+
+
 # Consecutive fault teardowns across attach epochs; reset only when a
 # session proves stable, so an enumerable-but-wedged device gets power-
 # cycled after three rapid faults instead of looping forever.
@@ -262,6 +283,48 @@ while True:
         ctap_read = dev.read
         ctap_write = dev.write
 
+        # Single funnel points for every CTAPHID packet sent downstream or
+        # upstream (verbatim relays and proxy re-emissions alike); the
+        # tracing build (make_debug.py) instruments exactly these two.
+        def send_downstream(pkt):
+            # A transient NAK/stall on the PIO bus can make dev.write raise
+            # an empty-message USBError (observed on proxy re-emission
+            # bursts); tearing the session down for it kills in-flight
+            # ceremonies. Retry with backoff instead - only a genuinely
+            # dead bus exhausts the attempts and re-raises to the outer
+            # fault handler.
+            for attempt in range(3):
+                last_op[0] = "write_down"
+                try:
+                    ctap_write(ctap_out, pkt, timeout=100)
+                    print("F>YK:", " ".join("{:02x}".format(b) for b in pkt[:8]))
+                    return
+                except usb.core.USBError:
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.01)
+
+        def send_upstream(pkt):
+            last_op[0] = "send_up"
+            try:
+                ctap_send(pkt)
+                print("Y>PC:", " ".join("{:02x}".format(b) for b in pkt[:8]))
+            except OSError:
+                # One retry: the native USB stack can transiently refuse a
+                # back-to-back send_report on the re-emission burst.
+                time.sleep(0.005)
+                last_op[0] = "send_up_retry"
+                ctap_send(pkt)
+
+        # CTAP2/CBOR message-layer state, one in-flight message per
+        # direction (see ctaphid_proxy.py for the limitation rationale).
+        req_asm = ctaphid_proxy.CtapAssembler()   # PC -> YubiKey
+        resp_asm = ctaphid_proxy.CtapAssembler()  # YubiKey -> PC
+
+        # Fault attribution: the outer handler reports which call raised
+        # (str(e) is often empty for usb.core.USBError/OSError).
+        last_op = ["init"]
+
         pending_conts = 0  # CONT packets the host still owes for this message
         resp_pending = 0  # CONT packets the YubiKey still owes for its response
         touch_pending = False  # KEEPALIVE reports the key awaits a finger
@@ -277,22 +340,45 @@ while True:
                     report = get_report()
                     if report is None:
                         break
-                    ctap_write(ctap_out, report, timeout=100)
-                    print("F>YK:", " ".join("{:02x}".format(b) for b in report[:8]))
                     cmd_byte = report[4]
-                    if cmd_byte & 0x80:  # INIT-type packet: header carries bcnt
-                        pending_conts = conts_expected(
-                            (report[5] << 8) | report[6]
-                        )
-                    else:  # continuation packet
-                        if pending_conts > 0:
-                            pending_conts -= 1
-                    if pending_conts == 0:
-                        # request complete (or single-packet): expect a reply
-                        read_ms = RESP_MS
-                    else:
-                        # host still streaming CONTs: drain priority
-                        read_ms = IDLE_MS
+                    handled = False
+                    if cmd_byte == CMD_CBOR or (
+                        req_asm.active and not cmd_byte & 0x80
+                    ):
+                        # CTAP2/CBOR: message-layer proxy. The reassembled
+                        # message passes through cbor_request_hook (identity
+                        # in Phase 1) and is re-packetized canonically.
+                        r = req_asm.feed(report)
+                        if r is None:
+                            # host still streaming CONTs: drain priority
+                            read_ms = IDLE_MS
+                            handled = True
+                        elif r is not ctaphid_proxy.BYPASS:
+                            cid, msg = r
+                            msg = cbor_request_hook(cid, msg)
+                            for pkt in ctaphid_proxy.packetize(cid, msg):
+                                send_downstream(pkt)
+                            # request complete (or single-packet): reply due
+                            read_ms = RESP_MS
+                            handled = True
+                    if not handled:
+                        # Any other command (or a proxy bypass): verbatim.
+                        last_op[0] = "write_down_verbatim"
+                        send_downstream(report)
+                        if cmd_byte & 0x80:  # INIT-type packet: bcnt in header
+                            pending_conts = conts_expected(
+                                (report[5] << 8) | report[6]
+                            )
+                        else:  # continuation packet
+                            if pending_conts > 0:
+                                pending_conts -= 1
+                        if pending_conts == 0:
+                            # request complete (or single-packet): expect a
+                            # reply
+                            read_ms = RESP_MS
+                        else:
+                            # host still streaming CONTs: drain priority
+                            read_ms = IDLE_MS
 
             # 2) YubiKey -> PC : CTAPHID IN reports (forward verbatim).
             if ctap_in is not None:
@@ -302,6 +388,7 @@ while True:
                 # though the device is fine. Retry a few times before
                 # tearing down; only persistent errors mean a real fault.
                 try:
+                    last_op[0] = "read"
                     n = ctap_read(
                         ctap_in, ctap_buf, timeout=read_ms, raise_on_timeout=False
                     )
@@ -314,16 +401,41 @@ while True:
                 # Interrupt IN packets are atomic: only ever forward full
                 # 64-byte reports, never a short read padded with stale bytes.
                 if n == CTAP_REPORT_LEN:
-                    print("Y>PC:", " ".join("{:02x}".format(ctap_buf[i]) for i in range(8)))
-                    ctap_send(ctap_buf)
                     cmd_byte = ctap_buf[4]
-                    if cmd_byte & 0x80:  # response INIT packet
-                        resp_pending = conts_expected(
-                            (ctap_buf[5] << 8) | ctap_buf[6]
-                        )
-                    else:  # response continuation packet
-                        if resp_pending > 0:
-                            resp_pending -= 1
+                    handled = False
+                    if cmd_byte == CMD_CBOR or (
+                        resp_asm.active and not cmd_byte & 0x80
+                    ):
+                        # CTAP2/CBOR: message-layer proxy. The reassembled
+                        # response passes through cbor_response_hook
+                        # (identity in Phase 1) before going upstream.
+                        r = resp_asm.feed(ctap_buf)
+                        if r is None:
+                            # response CONTs still due: stay open
+                            read_ms = RESP_MS
+                            handled = True
+                        elif r is not ctaphid_proxy.BYPASS:
+                            cid, msg = r
+                            msg = cbor_response_hook(cid, msg)
+                            for pkt in ctaphid_proxy.packetize(cid, msg):
+                                send_upstream(pkt)
+                            read_ms = IDLE_MS  # transaction complete
+                            handled = True
+                    if not handled:
+                        # Any other command (or a proxy bypass): verbatim.
+                        last_op[0] = "send_up_verbatim"
+                        send_upstream(ctap_buf)
+                        if cmd_byte & 0x80:  # response INIT packet
+                            resp_pending = conts_expected(
+                                (ctap_buf[5] << 8) | ctap_buf[6]
+                            )
+                        else:  # response continuation packet
+                            if resp_pending > 0:
+                                resp_pending -= 1
+                        # stay open only while response CONTs are still due;
+                        # once the transaction completes, return to drain
+                        # priority so the next request is never starved.
+                        read_ms = RESP_MS if resp_pending else IDLE_MS
                     # Touch detection (observation only, no protocol change):
                     # a KEEPALIVE (cmd 0x3B -> 0xBB on the wire) with status
                     # 0x02 means the key is waiting for user presence; any
@@ -331,17 +443,25 @@ while True:
                     # (or cancelled). The first status-2 KEEPALIVE arms the
                     # auto-touch timer; only a response clears it, so a stray
                     # "processing" keepalive cannot restart the countdown.
+                    # Runs on packet ARRIVAL, so it also fires for CBOR
+                    # responses held briefly in the reassembly buffer.
                     if cmd_byte == 0xBB:
-                        if ctap_buf[7] == 2 and not touch_pending:
+                        # Arm only when no hold is in flight (touch_phase == 0):
+                        # arming during the phase-2 hold would overwrite it
+                        # and leave GP15 stuck low (no fresh touch edge for
+                        # the next ceremony -> ACTION_TIMEOUT). Pre-existing
+                        # race, surfaced by unattended back-to-back
+                        # ceremonies; fixed during the Phase-1 proxy work.
+                        if (
+                            ctap_buf[7] == 2
+                            and not touch_pending
+                            and touch_phase == 0
+                        ):
                             touch_pending = True
                             touch_phase = 1
                             touch_start = time.monotonic()
                     elif cmd_byte & 0x80:
                         touch_pending = False
-                    # stay open only while response CONTs are still due;
-                    # once the transaction completes, return to drain
-                    # priority so the next request is never starved.
-                    read_ms = RESP_MS if resp_pending else IDLE_MS
                 else:
                     read_ms = IDLE_MS  # window expired - back to drain priority
 
@@ -387,7 +507,13 @@ while True:
         if time.monotonic() - attached_at > 5.0:
             teardowns = 0  # the session was stable for a while - not a wedge
         teardowns += 1
-        print("relay error:", e, "- re-enumerating")
+        try:
+            import sys
+
+            sys.print_exception(e)  # full traceback (str(e) is often empty)
+        except Exception:
+            pass
+        print("relay error at", last_op[0], ":", e, "- re-enumerating")
         if teardowns >= 3:
             print("repeated faults - power-cycling YubiKey")
             yubikey_power(False)

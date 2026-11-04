@@ -18,19 +18,17 @@ import sys
 
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 
-TRACE_HOST_TO_YK = '''                    ctap_write(ctap_out, report, timeout=100)
-                    print("F>YK:", " ".join("{:02x}".format(b) for b in report[:8]))
-                    cmd_byte = report[4]'''
+TRACE_HOST_TO_YK = '''                    ctap_write(ctap_out, pkt, timeout=100)
+                    print("F>YK:", " ".join("{:02x}".format(b) for b in pkt[:8]))'''
 
-TRACE_YK_TO_HOST = '''                if n == CTAP_REPORT_LEN:
-                    print("Y>PC:", " ".join("{:02x}".format(ctap_buf[i]) for i in range(8)))
-                    ctap_send(ctap_buf)'''
+TRACE_YK_TO_HOST = '''            try:
+                ctap_send(pkt)
+                print("Y>PC:", " ".join("{:02x}".format(b) for b in pkt[:8]))'''
 
-ANCHOR_HOST_TO_YK = '''                    ctap_write(ctap_out, report, timeout=100)
-                    cmd_byte = report[4]'''
+ANCHOR_HOST_TO_YK = '''                    ctap_write(ctap_out, pkt, timeout=100)'''
 
-ANCHOR_YK_TO_HOST = '''                if n == CTAP_REPORT_LEN:
-                    ctap_send(ctap_buf)'''
+ANCHOR_YK_TO_HOST = '''            try:
+                ctap_send(pkt)'''
 
 
 def build():

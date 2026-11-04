@@ -58,6 +58,14 @@ try:
     # 1. deploy the relay code and force a soft reload
     say(f"deploying {CODE_LOCAL} and reloading")
     subprocess.run(["cp", CODE_LOCAL, f"{CIRCUITPY}/code.py"], check=True)
+    # code.py may import from lib/ - keep the board's lib/ in sync too
+    lib_src = os.path.join(ROOT, "src", "lib")
+    lib_dst = os.path.join(CIRCUITPY, "lib")
+    os.makedirs(lib_dst, exist_ok=True)
+    for name in os.listdir(lib_src):
+        if name.endswith(".py"):
+            subprocess.run(["cp", os.path.join(lib_src, name),
+                            os.path.join(lib_dst, name)], check=True)
     subprocess.run(["sync"], check=True)
     time.sleep(2)
     ser.write(b"\x04")  # Ctrl-D soft reload

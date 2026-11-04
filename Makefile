@@ -41,7 +41,7 @@ deploy: ## Copy firmware sources (boot.py, code.py, lib/) to CIRCUITPY
 		exit 1; }
 	@cp src/boot.py src/code.py "$(CIRCUITPY)/"
 	@mkdir -p "$(CIRCUITPY)/lib"
-	@cp src/lib/adafruit_usb_host_descriptors.py "$(CIRCUITPY)/lib/"
+	@cp src/lib/*.py "$(CIRCUITPY)/lib/"
 	@sync
 	@echo "Deployed. code.py auto-reloads; boot.py changes also need: make reset"
 
