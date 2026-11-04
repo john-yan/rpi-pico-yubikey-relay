@@ -33,6 +33,7 @@ import usb_hid
 
 import adafruit_usb_host_descriptors
 import ctaphid_proxy
+import injector
 import persona
 import token_service
 
@@ -261,6 +262,11 @@ def conts_expected(bcnt):
 # flows, while UV-preferred flows work touch-only (UV=false).
 AUTOUV = True
 
+# Injector policy (plan.md §5.3): "follow" injects pinUvAuthParam only when
+# the request carries options.uv:true (Chrome's UV-required / discoverable
+# shape); "always" injects on every makeCredential/getAssertion.
+UV_POLICY = "follow"
+
 # Phase-3 token service (plan.md §5.4): the persona is gated on a live
 # pinUvAuthToken pushed by the host daemon over the CDC data port — the
 # PIN itself never leaves the host. Daemon absent/expired -> persona off
@@ -278,10 +284,10 @@ _ring = []
 _RING_MAX = 48
 
 
-def _ring_log(tag, pkt):
+def _ring_log(tag, b4):
     if len(_ring) >= _RING_MAX:
         _ring.pop(0)
-    _ring.append((tag, bytes(pkt[4:8])))
+    _ring.append((tag, bytes(b4)))
 
 
 def _ring_dump(reason):
@@ -301,6 +307,19 @@ def cbor_request_hook(cid, message):
         if len(_pending_req) > 32:
             _pending_req.clear()  # CTAPHID channels are never closed; cap growth
         _pending_req[cid] = message[0]
+        if token_svc.active() and message[0] in (
+            injector.CTAP2_MAKE_CREDENTIAL,
+            injector.CTAP2_GET_ASSERTION,
+        ):
+            # Phase-4 injector: strip options.uv and splice a genuine
+            # pinUvAuthParam so the key performs PIN-based UV while the
+            # PC still believes it talked to a biometric key.
+            new_msg, injected = injector.inject(
+                message, token_svc.token, token_svc.token_proto, UV_POLICY
+            )
+            if injected:
+                _ring_log("ij", message[:4])
+                return new_msg
     return message
 
 
@@ -310,6 +329,17 @@ def cbor_response_hook(cid, message):
         cmd = _pending_req.pop(cid, None)
         if cmd == persona.CTAP2_GET_INFO:
             return persona.rewrite_getinfo(message)
+        if (
+            cmd in (injector.CTAP2_MAKE_CREDENTIAL, injector.CTAP2_GET_ASSERTION)
+            and message
+            and message[0] == 0x33
+        ):
+            # PIN_AUTH_INVALID: our cached token went stale (e.g. PIN
+            # changed under us). Drop it; the daemon re-acquires on its
+            # next heartbeat (<=5s) and the persona falls back off until
+            # then. The affected ceremony fails visibly at the RP.
+            token_svc.token = None
+            print("token rejected (PIN_AUTH_INVALID) - dropped")
     return message
 
 
@@ -344,7 +374,7 @@ while True:
         # upstream (verbatim relays and proxy re-emissions alike); the
         # tracing build (make_debug.py) instruments exactly these two.
         def send_downstream(pkt):
-            _ring_log("F>", pkt)
+            _ring_log("F>", pkt[4:8])
             # A transient NAK/stall on the PIO bus can make dev.write raise
             # an empty-message USBError (observed on proxy re-emission
             # bursts); tearing the session down for it kills in-flight
@@ -358,13 +388,13 @@ while True:
                     print("F>YK:", " ".join("{:02x}".format(b) for b in pkt[:8]))
                     return
                 except usb.core.USBError:
-                    _ring_log("F!", pkt)  # retried downstream write
+                    _ring_log("F!", pkt[4:8])  # retried downstream write
                     if attempt == 2:
                         raise
                     time.sleep(0.01)
 
         def send_upstream(pkt):
-            _ring_log("Y>", pkt)
+            _ring_log("Y>", pkt[4:8])
             last_op[0] = "send_up"
             try:
                 ctap_send(pkt)
@@ -374,7 +404,7 @@ while True:
                 # back-to-back send_report on the re-emission burst.
                 # Ring-tagged ("Y!") so a retried-and-possibly-lost packet
                 # stays visible in failure forensics.
-                _ring_log("Y!", pkt)
+                _ring_log("Y!", pkt[4:8])
                 time.sleep(0.005)
                 last_op[0] = "send_up_retry"
                 ctap_send(pkt)
@@ -411,7 +441,7 @@ while True:
                     if report is None:
                         break
                     cmd_byte = report[4]
-                    _ring_log(">", report)
+                    _ring_log(">", report[4:8])
                     if not cmd_byte & 0x80 and not req_asm.active and not pending_conts:
                         # Orphaned host CONT: the PC is streaming a request
                         # continuation with no assembly and no verbatim
@@ -481,15 +511,15 @@ while True:
                 if n == CTAP_REPORT_LEN:
                     print("YK>>:", " ".join("{:02x}".format(ctap_buf[i]) for i in range(8)))
                     cmd_byte = ctap_buf[4]
-                    _ring_log("<", ctap_buf)
+                    _ring_log("<", ctap_buf[4:8])
                     # Broker/private-channel traffic first: consumed packets
                     # never reach the PC, the orphan detectors, or the touch
                     # state machine (a broker response INIT must not clear a
                     # concurrent Chrome touch-wait).
-                    handled = token_svc.consume(ctap_buf)
-                    if handled:
+                    brokered = token_svc.consume(ctap_buf)
+                    if brokered:
                         read_ms = RESP_MS if token_svc.waiting() else IDLE_MS
-                    if not handled and (
+                    if not brokered and (
                         not cmd_byte & 0x80
                         and not resp_asm.active
                         and not resp_pending
@@ -501,9 +531,10 @@ while True:
                         # signature of the dropped-response race (run-6
                         # forensics); dump everything we saw.
                         _ring_dump("orphan response CONT")
-                    if not handled and cmd_byte == 0xBF:
+                    if not brokered and cmd_byte == 0xBF:
                         _ring_dump("CTAPHID error from key")
-                    if not handled and (
+                    handled = False
+                    if not brokered and (
                         cmd_byte == CMD_CBOR
                         or (resp_asm.active and not cmd_byte & 0x80)
                     ):
@@ -537,16 +568,23 @@ while True:
                         # once the transaction completes, return to drain
                         # priority so the next request is never starved.
                         read_ms = RESP_MS if resp_pending else IDLE_MS
-                        # Touch detection (observation only, no protocol
-                        # change): a KEEPALIVE (cmd 0x3B -> 0xBB on the wire)
-                        # with status 0x02 means the key is waiting for user
-                        # presence; any other response packet means the
-                        # ceremony was answered (or cancelled). The first
-                        # status-2 KEEPALIVE arms the auto-touch timer; only
-                        # a response clears it, so a stray "processing"
-                        # keepalive cannot restart the countdown.
-                        # Runs on packet ARRIVAL, so it also fires for CBOR
-                        # responses held briefly in the reassembly buffer.
+                    # Touch detection (observation only, no protocol
+                    # change): a KEEPALIVE (cmd 0x3B -> 0xBB on the wire)
+                    # with status 0x02 means the key is waiting for user
+                    # presence; any other response packet means the
+                    # ceremony was answered (or cancelled). The first
+                    # status-2 KEEPALIVE arms the auto-touch timer; only
+                    # a response clears it, so a stray "processing"
+                    # keepalive cannot restart the countdown.
+                    # MUST run for relay-path packets regardless of proxy
+                    # dispatch: CBOR responses set handled=True while being
+                    # reassembled, and a response INIT that fails to clear
+                    # touch_pending here leaves it stuck - back-to-back
+                    # ceremonies on one channel then never re-arm (phase-2
+                    # regression caught by the phase-4 UV probes; luci masked
+                    # it because every plugin run starts with a CTAPHID INIT
+                    # that cleared it). Only broker traffic is excluded.
+                    if not brokered:
                         if cmd_byte == 0xBB:
                             # Arm only when no hold is in flight
                             # (touch_phase == 0): arming during the phase-2
