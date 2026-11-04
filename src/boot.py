@@ -18,7 +18,12 @@
 # usb_hid.enable() must run in boot.py, before USB starts. Changes take
 # effect after a hard reset (power cycle or microcontroller.reset()).
 
+import usb_cdc
 import usb_hid
+
+# Second CDC pair (ttyACM1) for the Auto-UV token daemon (plan.md §5.4):
+# the REPL console stays on ttyACM0; the daemon gets a raw data port.
+usb_cdc.enable(console=True, data=True)
 
 MODE = "ctaphid"
 

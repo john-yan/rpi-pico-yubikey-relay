@@ -26,6 +26,7 @@ import time
 
 import board
 import digitalio
+import usb_cdc
 import usb_host
 import usb.core
 import usb_hid
@@ -33,6 +34,7 @@ import usb_hid
 import adafruit_usb_host_descriptors
 import ctaphid_proxy
 import persona
+import token_service
 
 DIR_IN = 0x80
 CLASS_HID = 0x03
@@ -259,6 +261,12 @@ def conts_expected(bcnt):
 # flows, while UV-preferred flows work touch-only (UV=false).
 AUTOUV = True
 
+# Phase-3 token service (plan.md §5.4): the persona is gated on a live
+# pinUvAuthToken pushed by the host daemon over the CDC data port — the
+# PIN itself never leaves the host. Daemon absent/expired -> persona off
+# -> normal Chrome PIN prompts (safe fallback).
+token_svc = token_service.TokenService()
+
 _pending_req = {}  # cid -> CTAP2 command byte of the outstanding request
 
 # Rolling diagnostics (plan.md §7 fault forensics): raw packet headers are
@@ -298,7 +306,7 @@ def cbor_request_hook(cid, message):
 
 def cbor_response_hook(cid, message):
     """YubiKey -> PC CTAP2 message (GetInfo, assertions, errors)."""
-    if AUTOUV:
+    if AUTOUV and token_svc.active():
         cmd = _pending_req.pop(cid, None)
         if cmd == persona.CTAP2_GET_INFO:
             return persona.rewrite_getinfo(message)
@@ -314,8 +322,11 @@ while True:
     dev, kbd_ep, ctap_in, ctap_out = wait_for_yubikey()
     led.value = True  # solid: relay active
     attached_at = time.monotonic()
+    token_svc.on_attach()  # tokens died with the key's power cycle
 
     try:
+        # The daemon rides the CDC data port (ttyACM1, enabled in boot.py);
+        # stays None when the port is not enabled.
         # Hoisted bound methods: cuts per-iteration overhead on the RP2040.
         # CTAPHID entries stay None in keyboard mode (boot.py MODE="keyboard").
         get_report = (
@@ -346,6 +357,7 @@ while True:
                     ctap_write(ctap_out, pkt, timeout=100)
                     return
                 except usb.core.USBError:
+                    _ring_log("F!", pkt)  # retried downstream write
                     if attempt == 2:
                         raise
                     time.sleep(0.01)
@@ -358,6 +370,9 @@ while True:
             except OSError:
                 # One retry: the native USB stack can transiently refuse a
                 # back-to-back send_report on the re-emission burst.
+                # Ring-tagged ("Y!") so a retried-and-possibly-lost packet
+                # stays visible in failure forensics.
+                _ring_log("Y!", pkt)
                 time.sleep(0.005)
                 last_op[0] = "send_up_retry"
                 ctap_send(pkt)
@@ -366,6 +381,10 @@ while True:
         # direction (see ctaphid_proxy.py for the limitation rationale).
         req_asm = ctaphid_proxy.CtapAssembler()   # PC -> YubiKey
         resp_asm = ctaphid_proxy.CtapAssembler()  # YubiKey -> PC
+
+        # Broker writes go through the same hardened downstream funnel.
+        token_svc.sender = send_downstream
+        token_svc.port = usb_cdc.data
 
         # Fault attribution: the outer handler reports which call raised
         # (str(e) is often empty for usb.core.USBError/OSError).
@@ -380,6 +399,9 @@ while True:
         read_errors = 0  # consecutive spurious USBErrors on downstream reads
 
         while True:
+            # 0) token service: daemon commands, broker timeouts, heartbeats
+            token_svc.poll()
+
             # 1) PC -> YubiKey : drain ALL pending CTAPHID OUT reports.
             if get_report is not None:
                 while True:
@@ -457,7 +479,18 @@ while True:
                 if n == CTAP_REPORT_LEN:
                     cmd_byte = ctap_buf[4]
                     _ring_log("<", ctap_buf)
-                    if not cmd_byte & 0x80 and not resp_asm.active and not resp_pending:
+                    # Broker/private-channel traffic first: consumed packets
+                    # never reach the PC, the orphan detectors, or the touch
+                    # state machine (a broker response INIT must not clear a
+                    # concurrent Chrome touch-wait).
+                    handled = token_svc.consume(ctap_buf)
+                    if handled:
+                        read_ms = RESP_MS if token_svc.waiting() else IDLE_MS
+                    if not handled and (
+                        not cmd_byte & 0x80
+                        and not resp_asm.active
+                        and not resp_pending
+                    ):
                         # Orphaned CONT: the key is streaming a continuation
                         # with no response assembly in progress and no
                         # verbatim message pending either - the INIT packet
@@ -465,11 +498,11 @@ while True:
                         # signature of the dropped-response race (run-6
                         # forensics); dump everything we saw.
                         _ring_dump("orphan response CONT")
-                    if cmd_byte == 0xBF:
+                    if not handled and cmd_byte == 0xBF:
                         _ring_dump("CTAPHID error from key")
-                    handled = False
-                    if cmd_byte == CMD_CBOR or (
-                        resp_asm.active and not cmd_byte & 0x80
+                    if not handled and (
+                        cmd_byte == CMD_CBOR
+                        or (resp_asm.active and not cmd_byte & 0x80)
                     ):
                         # CTAP2/CBOR: message-layer proxy. The reassembled
                         # response passes through cbor_response_hook
@@ -501,32 +534,34 @@ while True:
                         # once the transaction completes, return to drain
                         # priority so the next request is never starved.
                         read_ms = RESP_MS if resp_pending else IDLE_MS
-                    # Touch detection (observation only, no protocol change):
-                    # a KEEPALIVE (cmd 0x3B -> 0xBB on the wire) with status
-                    # 0x02 means the key is waiting for user presence; any
-                    # other response packet means the ceremony was answered
-                    # (or cancelled). The first status-2 KEEPALIVE arms the
-                    # auto-touch timer; only a response clears it, so a stray
-                    # "processing" keepalive cannot restart the countdown.
-                    # Runs on packet ARRIVAL, so it also fires for CBOR
-                    # responses held briefly in the reassembly buffer.
-                    if cmd_byte == 0xBB:
-                        # Arm only when no hold is in flight (touch_phase == 0):
-                        # arming during the phase-2 hold would overwrite it
-                        # and leave GP15 stuck low (no fresh touch edge for
-                        # the next ceremony -> ACTION_TIMEOUT). Pre-existing
-                        # race, surfaced by unattended back-to-back
-                        # ceremonies; fixed during the Phase-1 proxy work.
-                        if (
-                            ctap_buf[7] == 2
-                            and not touch_pending
-                            and touch_phase == 0
-                        ):
-                            touch_pending = True
-                            touch_phase = 1
-                            touch_start = time.monotonic()
-                    elif cmd_byte & 0x80:
-                        touch_pending = False
+                        # Touch detection (observation only, no protocol
+                        # change): a KEEPALIVE (cmd 0x3B -> 0xBB on the wire)
+                        # with status 0x02 means the key is waiting for user
+                        # presence; any other response packet means the
+                        # ceremony was answered (or cancelled). The first
+                        # status-2 KEEPALIVE arms the auto-touch timer; only
+                        # a response clears it, so a stray "processing"
+                        # keepalive cannot restart the countdown.
+                        # Runs on packet ARRIVAL, so it also fires for CBOR
+                        # responses held briefly in the reassembly buffer.
+                        if cmd_byte == 0xBB:
+                            # Arm only when no hold is in flight
+                            # (touch_phase == 0): arming during the phase-2
+                            # hold would overwrite it and leave GP15 stuck
+                            # low (no fresh touch edge for the next ceremony
+                            # -> ACTION_TIMEOUT). Pre-existing race, surfaced
+                            # by unattended back-to-back ceremonies; fixed
+                            # during the Phase-1 proxy work.
+                            if (
+                                ctap_buf[7] == 2
+                                and not touch_pending
+                                and touch_phase == 0
+                            ):
+                                touch_pending = True
+                                touch_phase = 1
+                                touch_start = time.monotonic()
+                        elif cmd_byte & 0x80:
+                            touch_pending = False
                 else:
                     read_ms = IDLE_MS  # window expired - back to drain priority
 

@@ -303,6 +303,24 @@ What we give up / accept:
   Verify: daemon logs token acquisition; Pico caches; wrong-PIN path
   disables cleanly with retries counter intact (`getPinRetries` before/
   after).
+- **Phase 3 — Token service. DONE (2025-11-04).** boot.py enables a CDC
+  data port (ttyACM1); src/lib/token_service.py implements the Pico side
+  (private-channel allocation via nonce-matched CTAPHID INIT, brokered
+  CTAP2 exchanges with their own assembler, token cache, heartbeat/
+  epoch gating); utils/autouv_daemon.py holds the PIN on the host and
+  runs the full clientPIN PAKE (protocol 2, hand-rolled against the
+  python-fido2 reference) through the broker. Persona is now gated on a
+  live token + fresh daemon heartbeat (fallback: off -> Chrome PIN
+  prompts). Verified: token acquired through the relay (retries 8,
+  32-byte protocol-2 token), persona on/off transitions both ways,
+  wrong-PIN aborts after exactly one attempt with exit 2 (retries
+  8->7, correct PIN restores), luci reauth through persona+daemon,
+  make test/e2e. NOTE (clientPIN CBOR keys are positional in CTAP2:
+  1=pinUvAuthProtocol, 2=subCommand, 3=keyAgreement, 6=pinHashEnc —
+  getting these wrong yields CBOR_UNEXPECTED_TYPE 0x11). The rare
+  dropped-response-INIT failure (~5% of luci runs, see phase-2 note)
+  remains open; send-retry events are now ring-tagged ("Y!"/"F!") so
+  the next capture will show whether the lost INIT hit the retry path.
 - **Phase 4 — Injector.** CBOR splice + policy. Verify: Chrome matrix
   (below); uv=true assertion confirmed via RP-side or
   `chrome://webauthn-internals`.
