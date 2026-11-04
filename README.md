@@ -17,9 +17,7 @@ cautions — is in [SCHEMATIC.md](SCHEMATIC.md).
 | File | Purpose |
 |---|---|
 | `src/boot.py` | Defines the PC-facing USB device (CTAPHID or Keyboard). **Deploy to CIRCUITPY.** |
-| `src/code.py` | The relay orchestrator. **Deploy to CIRCUITPY.** |
-| `src/code_debug.py` | Generated: code.py + packet tracing. Regenerate with `python3 src/make_debug.py`. **Warning:** logs the first 8 bytes of every CTAPHID packet to the serial console — don't leave it deployed |
-| `src/make_debug.py` | Generator for code_debug.py (`--check` verifies it is current) |
+| `src/code.py` | The relay orchestrator: the whole program lives in `main(is_debug=False)`, with `IS_DEBUG = False` at the top toggling packet tracing (`make deploy-debug` deploys it with tracing on). **Warning:** tracing logs the first 8 bytes of every CTAPHID packet to the serial console — don't leave it enabled. **Deploy to CIRCUITPY.** |
 | `src/lib/adafruit_usb_host_descriptors.py` | Descriptor parsing helper. **Deploy to CIRCUITPY/lib.** |
 | `src/lib/ctaphid_proxy.py` | CTAPHID message-layer proxy: reassembles CTAP2/CBOR (`0x90`) messages and re-packetizes them through the identity hooks in `code.py` (Auto-UV phases 2–4 install the persona/injector there). **Deploy to CIRCUITPY/lib.** |
 | `src/lib/cbor_min.py` | Minimal canonical CTAP2 CBOR codec (Auto-UV), with a nesting-depth cap. **Deploy to CIRCUITPY/lib.** |
@@ -70,7 +68,7 @@ pinned version with `make download` (or another via
 | `make flash UF2=<file>` | Flash firmware (Pico in BOOTSEL mode; RPI-RP2 drive must be mounted) |
 | `make test` | Host-side CTAPHID verification against the running relay |
 | `make e2e` | Full pipeline: deploy production code, soft-reload, verify, capture the relay log |
-| `make check` / `make debug` | Verify / regenerate code_debug.py |
+| `make deploy-debug` | Deploy code.py with packet tracing enabled (flips `IS_DEBUG` in the deployed copy) |
 | `make log SECS=15` | Passively listen to the relay serial console |
 | `make clean` | Remove Python cache dirs |
 

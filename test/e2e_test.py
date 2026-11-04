@@ -2,10 +2,11 @@
 """End-to-end relay integration test.
 
 Single owner of /dev/ttyACM0: (re)deploys the given code file (default:
-production code.py; pass code_debug.py explicitly for packet tracing),
-soft-reloads the board, then runs host-side CTAPHID INIT + PING checks
-(from test_ctaphid.py helpers) against the relay's hidraw node and prints
-the relay's output interleaved. Exits non-zero on any failure.
+production src/code.py), soft-reloads the board, then runs host-side
+CTAPHID INIT + PING checks (from test_ctaphid.py helpers) against the
+relay's hidraw node and prints the relay's output interleaved. Exits
+non-zero on any failure. For a packet-tracing run, `make deploy-debug`
+first, then run this unchanged.
 """
 
 import os

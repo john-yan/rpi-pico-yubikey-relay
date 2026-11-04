@@ -45,11 +45,12 @@ deploy: ## Copy firmware sources (boot.py, code.py, lib/) to CIRCUITPY
 	@sync
 	@echo "Deployed. code.py auto-reloads; boot.py changes also need: make reset"
 
-deploy-debug: ## Deploy the tracing build (code_debug.py) as code.py
+deploy-debug: ## Deploy code.py with packet tracing (IS_DEBUG=True) as code.py
 	@test -d "$(CIRCUITPY)" || { echo "CIRCUITPY not mounted at $(CIRCUITPY)"; exit 1; }
-	@cp src/code_debug.py "$(CIRCUITPY)/code.py"
+	@cp src/code.py "$(CIRCUITPY)/code.py"
+	@sed -i 's/^IS_DEBUG = False/IS_DEBUG = True/' "$(CIRCUITPY)/code.py"
 	@sync
-	@echo "WARNING: tracing build deployed - it logs CTAPHID packet headers"
+	@echo "WARNING: tracing mode deployed - it logs CTAPHID packet headers"
 	@echo "to the serial console. Redeploy production code with: make deploy"
 
 reset: ## Hard-reset the board (applies boot.py changes; GP5 re-attaches YubiKey)
@@ -67,12 +68,6 @@ unit: ## Run the host-side unit tests (no hardware needed)
 
 e2e: ## Full pipeline: deploy production code, soft-reload, verify, capture log
 	python3 test/e2e_test.py
-
-check: ## Verify code_debug.py is in sync with code.py
-	python3 src/make_debug.py --check
-
-debug: ## Regenerate code_debug.py from code.py
-	python3 src/make_debug.py
 
 log: ## Passively listen to the relay console (SECS=15)
 	python3 utils/listen_repl.py $(SECS)
