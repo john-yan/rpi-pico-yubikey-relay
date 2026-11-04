@@ -321,9 +321,32 @@ What we give up / accept:
   dropped-response-INIT failure (~5% of luci runs, see phase-2 note)
   remains open; send-retry events are now ring-tagged ("Y!"/"F!") so
   the next capture will show whether the lost INIT hit the retry path.
-- **Phase 4 — Injector.** CBOR splice + policy. Verify: Chrome matrix
-  (below); uv=true assertion confirmed via RP-side or
-  `chrome://webauthn-internals`.
+- **Phase 4 — Injector. DONE (2025-11-04).** src/lib/sha256.py (pure-
+  Python SHA-256 - the RP2040 CircuitPython build's hashlib has no
+  sha256; verified byte-identical to CPython across padding
+  boundaries, ~250 ms per ceremony HMAC) + src/lib/injector.py (uv
+  stripped, pinUvAuthParam = HMAC(token, clientDataHash) spliced,
+  positional per-command CTAP2 keys, follow/always policy, fail-open)
+  wired into cbor_request_hook; PIN_AUTH_INVALID responses drop the
+  cached token. Verified on-device (daemon + persona + injector):
+  makeCredential {uv:true} -> UV=true; passkey shape {uv:true,rk:true}
+  -> UV=true; getAssertion {uv:true} -> UV=true; discouraged shape
+  untouched (UV=false); luci 5/5 + 10/10; make test.
+  Two regressions found and fixed during phase-4 verification:
+  (a) the phase-2 re-indent had scoped touch detection inside the
+  proxy dispatch, so CBOR response INITs never cleared touch_pending
+  (back-to-back ceremonies on one channel lost auto-touch; luci
+  masked it via its per-run CTAPHID INIT) - now keyed on
+  broker-consumed; (b) the same refactor leaked broker packets into
+  the verbatim upstream path - with no hidraw reader, send_report
+  blocked 2 s per packet and tore the session down, killing daemon
+  acquisitions (user-reported; fixed by excluding broker traffic
+  from the verbatim path explicitly).
+  Lost-packet recovery deployed for the open ~5-10% failure: orphaned
+  or mid-message-lost response CONTs now produce a clean CTAPHID
+  ERROR (INVALID_SEQ) to the client plus silent swallowing of the
+  strays, instead of leaked CONTs surfacing as INVALID_COMMAND; the
+  event ring-dumps ("lost response packet") for forensics.
 - **Phase 5 — Hardening.** systemd unit, keyring, LED patterns, REPL logs,
   fault-recovery integration.
 - **Phase 6 (optional) — credMgmt.** Intercept Chrome's

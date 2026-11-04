@@ -429,6 +429,7 @@ while True:
         touch_start = 0.0  # monotonic time of the first waiting KEEPALIVE
         read_ms = IDLE_MS
         read_errors = 0  # consecutive spurious USBErrors on downstream reads
+        drop_stray_conts = False  # swallowing CONTs of a lost response
 
         while True:
             # 0) token service: daemon commands, broker timeouts, heartbeats
@@ -519,6 +520,20 @@ while True:
                     brokered = token_svc.consume(ctap_buf)
                     if brokered:
                         read_ms = RESP_MS if token_svc.waiting() else IDLE_MS
+                    if (
+                        not brokered
+                        and drop_stray_conts
+                        and not cmd_byte & 0x80
+                    ):
+                        # Swallowing stray CONTs of a response whose INIT or
+                        # sibling CONT was lost on the downstream read race:
+                        # the message is unrecoverable, the client already got
+                        # a clean CTAPHID ERROR (INVALID_SEQ). Any INIT-type
+                        # packet ends the swallow and resumes normal relaying.
+                        _ring_log("XX", ctap_buf[4:8])
+                        brokered = True  # consumed: skip all relay handling
+                    elif not brokered and drop_stray_conts:
+                        drop_stray_conts = False  # next message begins
                     if not brokered and (
                         not cmd_byte & 0x80
                         and not resp_asm.active
@@ -526,11 +541,26 @@ while True:
                     ):
                         # Orphaned CONT: the key is streaming a continuation
                         # with no response assembly in progress and no
-                        # verbatim message pending either - the INIT packet
-                        # was lost or consumed elsewhere. This is the
-                        # signature of the dropped-response race (run-6
-                        # forensics); dump everything we saw.
-                        _ring_dump("orphan response CONT")
+                        # verbatim message pending either - a downstream
+                        # packet was lost (read-abort race on the PIO bus).
+                        # The message is unrecoverable: tell the client with
+                        # a clean CTAPHID ERROR (INVALID_SEQ) it can retry
+                        # from, and swallow the remaining CONTs, instead of
+                        # leaking them (which surfaces as a confusing
+                        # INVALID_COMMAND at the client).
+                        _ring_dump("lost response packet - INVALID_SEQ sent")
+                        drop_stray_conts = True
+                        err = bytearray(CTAP_REPORT_LEN)
+                        err[0] = ctap_buf[0]
+                        err[1] = ctap_buf[1]
+                        err[2] = ctap_buf[2]
+                        err[3] = ctap_buf[3]
+                        err[4] = 0xBF  # CTAPHID ERROR
+                        err[5] = 0
+                        err[6] = 1
+                        err[7] = 0x04  # INVALID_SEQ
+                        send_upstream(err)
+                        brokered = True  # this CONT is part of the wreckage
                     if not brokered and cmd_byte == 0xBF:
                         _ring_dump("CTAPHID error from key")
                     handled = False
@@ -541,6 +571,7 @@ while True:
                         # CTAP2/CBOR: message-layer proxy. The reassembled
                         # response passes through cbor_response_hook
                         # (identity in Phase 1) before going upstream.
+                        was_active = resp_asm.active
                         r = resp_asm.feed(ctap_buf)
                         if r is None:
                             # response CONTs still due: stay open
@@ -553,8 +584,31 @@ while True:
                                 send_upstream(pkt)
                             read_ms = IDLE_MS  # transaction complete
                             handled = True
-                    if not handled:
+                        elif was_active and not cmd_byte & 0x80:
+                            # BYPASS on a CONT that belonged to an active
+                            # assembly: a sibling CONT was lost mid-message.
+                            # Same recovery as the orphan path above.
+                            _ring_dump("lost mid-response CONT - INVALID_SEQ sent")
+                            drop_stray_conts = True
+                            err = bytearray(CTAP_REPORT_LEN)
+                            err[0] = ctap_buf[0]
+                            err[1] = ctap_buf[1]
+                            err[2] = ctap_buf[2]
+                            err[3] = ctap_buf[3]
+                            err[4] = 0xBF
+                            err[5] = 0
+                            err[6] = 1
+                            err[7] = 0x04
+                            send_upstream(err)
+                            handled = True
+                    if not brokered and not handled:
                         # Any other command (or a proxy bypass): verbatim.
+                        # Broker packets are excluded TWICE (here and in the
+                        # dispatch above): leaking one into send_upstream
+                        # with no hidraw reader blocks the main loop 2s per
+                        # packet in send_report, then tears the session down
+                        # (the phase-3/4 refactor briefly regressed this and
+                        # killed daemon acquisitions with no reader active).
                         last_op[0] = "send_up_verbatim"
                         send_upstream(ctap_buf)
                         if cmd_byte & 0x80:  # response INIT packet
