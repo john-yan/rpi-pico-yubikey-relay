@@ -59,7 +59,10 @@ try:
     # 1. deploy the relay code and force a soft reload
     say(f"deploying {CODE_LOCAL} and reloading")
     subprocess.run(["cp", CODE_LOCAL, f"{CIRCUITPY}/code.py"], check=True)
-    # code.py may import from lib/ - keep the board's lib/ in sync too
+    # code.py may import from lib/ and reads its knobs from config.py -
+    # keep the board's copy of both in sync too
+    subprocess.run(["cp", os.path.join(ROOT, "src", "config.py"),
+                    f"{CIRCUITPY}/config.py"], check=True)
     lib_src = os.path.join(ROOT, "src", "lib")
     lib_dst = os.path.join(CIRCUITPY, "lib")
     os.makedirs(lib_dst, exist_ok=True)

@@ -17,12 +17,13 @@ cautions — is in [SCHEMATIC.md](SCHEMATIC.md).
 | File | Purpose |
 |---|---|
 | `src/boot.py` | Defines the PC-facing USB device (CTAPHID or Keyboard). **Deploy to CIRCUITPY.** |
-| `src/code.py` | The relay orchestrator: the whole program lives in `main(is_debug=False)`, with `IS_DEBUG = False` at the top toggling packet tracing (`make deploy-debug` deploys it with tracing on). **Warning:** tracing logs the first 8 bytes of every CTAPHID packet to the serial console — don't leave it enabled. **Deploy to CIRCUITPY.** |
+| `src/code.py` | The relay orchestrator: the whole program lives in `main(is_debug=False)`; all knobs live in config.py. **Deploy to CIRCUITPY.** |
+| `src/config.py` | All relay configuration: pin assignment (`PIN_POWER`/`PIN_SIM_TOUCH`/`PIN_USB_DP`/`PIN_USB_DM`/`PIN_LED`), protocol facts, timing, downstream allowlist (`ALLOWED_VIDS`), Auto-UV switches (`AUTOUV`/`UV_POLICY`/`UV_RPIDS`), `IS_DEBUG` packet tracing. **Deploy to CIRCUITPY** (edit the deployed copy to tweak — code.py auto-reloads) |
 | `src/lib/adafruit_usb_host_descriptors.py` | Descriptor parsing helper. **Deploy to CIRCUITPY/lib.** |
 | `src/lib/ctaphid_proxy.py` | CTAPHID message-layer proxy: reassembles CTAP2/CBOR (`0x90`) messages and re-packetizes them through the identity hooks in `code.py` (Auto-UV phases 2–4 install the persona/injector there). **Deploy to CIRCUITPY/lib.** |
 | `src/lib/cbor_min.py` | Minimal canonical CTAP2 CBOR codec (Auto-UV), with a nesting-depth cap. **Deploy to CIRCUITPY/lib.** |
 | `src/lib/persona.py` | GetInfo persona: rewrites responses so the host sees a biometric key (no PIN dialog). **Deploy to CIRCUITPY/lib.** |
-| `src/lib/injector.py` | Auto-UV injector: strips `options.uv`, splices `pinUvAuthParam = HMAC(token, clientDataHash)`; `UV_POLICY`/`UV_RPIDS` knobs in code.py. **Deploy to CIRCUITPY/lib.** |
+| `src/lib/injector.py` | Auto-UV injector: strips `options.uv`, splices `pinUvAuthParam = HMAC(token, clientDataHash)`; `UV_POLICY`/`UV_RPIDS` knobs in config.py. **Deploy to CIRCUITPY/lib.** |
 | `src/lib/sha256.py` | Pure-Python SHA-256 (the RP2040 CircuitPython build has no `hashlib.sha256`). **Deploy to CIRCUITPY/lib.** |
 | `src/lib/token_service.py` | Pico side of the Auto-UV token service: CDC protocol (ttyACM1), private-channel broker, token cache. **Deploy to CIRCUITPY/lib.** |
 | `utils/autouv_daemon.py` | Host daemon: holds the FIDO2 PIN, acquires the pinUvAuthToken through the relay, gates the persona. Run: `python3 utils/autouv_daemon.py` (needs `pyserial` + `cryptography`; PIN from `PICO_RELAY_PIN`, `.pin`, or getpass — never a CLI flag). |
@@ -60,15 +61,14 @@ pinned version with `make download` (or another via
 
 | Target | Purpose |
 |---|---|
-| `make deploy` | Copy `src/boot.py`, `src/code.py`, `src/lib/` to CIRCUITPY (code auto-reloads) |
-| `make deploy-debug` | Deploy the tracing build as code.py (packet-header logging — see warning) |
+| `make deploy` | Copy `src/boot.py`, `src/code.py`, `src/config.py`, `src/lib/` to CIRCUITPY (code auto-reloads) |
+| `make deploy-debug` | Deploy with packet tracing enabled (flips `IS_DEBUG` in the deployed config.py) |
 | `make reset` | Hard-reset the board; applies boot.py changes, GP5 re-attaches the YubiKey |
 | `make download [VERSION=10.3.1]` | Fetch a CircuitPython uf2 image (git-ignored) |
 | `make install-rules` / `make remove-rules` | Install / remove the udev hidraw-access rule (sudo; idempotent) |
 | `make flash UF2=<file>` | Flash firmware (Pico in BOOTSEL mode; RPI-RP2 drive must be mounted) |
 | `make test` | Host-side CTAPHID verification against the running relay |
 | `make e2e` | Full pipeline: deploy production code, soft-reload, verify, capture the relay log |
-| `make deploy-debug` | Deploy code.py with packet tracing enabled (flips `IS_DEBUG` in the deployed copy) |
 | `make log SECS=15` | Passively listen to the relay serial console |
 | `make clean` | Remove Python cache dirs |
 
@@ -149,7 +149,7 @@ TinyUSB-based build like the Feather RP2040 USB Host's Arduino offering).
 - Host writes shorter than 64 bytes are silently dropped by CircuitPython
   (`out_report_lengths` mismatch). Real CTAPHID stacks always write 64.
 - **Downstream allowlist**: only Yubico devices (VID 0x1050) are relayed
-  (`ALLOWED_VIDS` in code.py). The PC always sees the Pico's identity
+  (`ALLOWED_VIDS` in config.py). The PC always sees the Pico's identity
   upstream, so host-side policies cannot distinguish the downstream
   device — this allowlist is that gate. Extend the tuple for other keys.
 - **udev rule breadth**: the rule matches every stock-CircuitPython Pico
@@ -163,7 +163,7 @@ TinyUSB-based build like the Feather RP2040 USB Host's Arduino offering).
   from the relayed key without knowing the PIN (the token is the legacy
   *unscoped* one — fw 5.4.3 rejects scoped tokens — and auto-touch supplies
   presence after 3 s). That is the deliberate convenience-for-assurance
-  trade of this feature; `UV_RPIDS` in code.py can restrict injection to
+  trade of this feature; `UV_RPIDS` in config.py can restrict injection to
   an allowlist of relying-party IDs. Unplugging the daemon (or Ctrl-C)
   restores PIN-based UV immediately.
 - **Auto-UV is experimental pending the real-Chrome dry-run**: everything

@@ -180,7 +180,7 @@ For each reassembled upstream `0x90` message with CTAP2 command
 
 1. Extract `clientDataHash` (`0x01`… `0x04` field, byte string), and
    `rp/rpId` for the token permission scope.
-2. Policy `UV_POLICY` (config in `code.py`):
+2. Policy `UV_POLICY` (config in `config.py`):
    - `follow` (default): inject only when Chrome's `options` map contains
      `uv: true` (i.e. Chrome asked for UV). `UV=discouraged` stays
      UV=false — luci behavior preserved bit-for-bit.
@@ -257,7 +257,7 @@ What we give up / accept:
    Consequence, stated plainly: while the daemon is live, ANY process in
    the user's session can obtain UV=true assertions for any RP without
    knowing the PIN (auto-touch supplies presence after 1 s). The optional
-   `UV_RPIDS` allowlist in code.py restricts injection to listed RP IDs;
+   `UV_RPIDS` allowlist in config.py restricts injection to listed RP IDs;
    empty (shipped default) allows all. This is the deliberate
    convenience-for-assurance trade the user has chosen.
    - CDC control-plane note (review finding): the ttyACM1 protocol is
@@ -419,7 +419,7 @@ genuine UV=true assertion from the key through the relay.**
 
 ## 11. Rollout & rollback
 
-- `AUTOUV = True` ships in code.py; the persona and injector hooks are
+- `AUTOUV = True` ships in config.py; the persona and injector hooks are
   gated on a live daemon + token (`token_svc.active()`), so with the daemon
   stopped the relay behaves exactly like the pre-Auto-UV pipe for FIDO2.
   Note the CTAPHID message-layer proxy, orphan detectors and

@@ -24,7 +24,6 @@
 import array
 import time
 
-import board
 import digitalio
 import usb_cdc
 import usb_host
@@ -37,53 +36,64 @@ import injector
 import persona
 import token_service
 
-DIR_IN = 0x80
-CLASS_HID = 0x03
-SUBCLASS_BOOT = 0x01
-KBD_REPORT_LEN = 8
-CTAP_REPORT_LEN = 64
-CMD_CBOR = ctaphid_proxy.CMD_CBOR  # CTAPHID wire command for CTAP2/CBOR
-ATTACH_TIMEOUT = 5.0  # seconds before power-cycling the downstream device
-AUTO_TOUCH_DELAY = 1.0  # seconds of touch-wait before simulating the finger
-AUTO_TOUCH_HOLD = 1.0  # seconds to hold the simulated touch
+from config import (
+    ALLOWED_VIDS,
+    ATTACH_TIMEOUT,
+    AUTO_TOUCH_DELAY,
+    AUTO_TOUCH_HOLD,
+    AUTOUV,
+    CLASS_HID,
+    CMD_CBOR,
+    CONT_DATA_MAX,
+    CTAP_REPORT_LEN,
+    DIR_IN,
+    IDLE_MS,
+    INIT_DATA_MAX,
+    IS_DEBUG,
+    KBD_REPORT_LEN,
+    PIN_LED,
+    PIN_POWER,
+    PIN_SIM_TOUCH,
+    PIN_USB_DM,
+    PIN_USB_DP,
+    RESP_MS,
+    RING_MAX,
+    SUBCLASS_BOOT,
+    UV_POLICY,
+    UV_RPIDS,
+)
 
-# Downstream device allowlist: only Yubico security keys are relayed.
-# The upstream identity is always the Pico regardless of what answers
-# downstream, so this is the only gate on what gets to act as the user's
-# authenticator. Extend the tuple to trust other vendors' keys.
-ALLOWED_VIDS = (0x1050,)
 
-# Packet tracing: set True (or run `make deploy-debug`) to log the first
-# 8 bytes of every CTAPHID packet - channel ID, command, length and
-# payload fragments - to the serial console. Do not leave enabled in
-# normal use.
-IS_DEBUG = False
+def init():
+    """One-time hardware bring-up: pins, power sequence, upstream devices.
 
+    Returns the handles the relay loop builds on:
+        (sim_touch, led, yubikey_power, kbd_upstream, ctap_upstream)
 
-def main(is_debug=False):
+    - sim_touch / led: DigitalInOut handles (pin wiring in config.py)
+    - yubikey_power(on): power-switch closure (the raw pin stays private)
+    - kbd_upstream / ctap_upstream: the boot.py-enabled HID devices; either
+      may be None (single-function mode), both None raises
+
+    The cold-boot power sequence below sidesteps CircuitPython #8886 (a
+    device attached around host-stack init is never enumerated): both
+    control pins float at raw boot, so the YubiKey stays unpowered until
+    this code deliberately drives them, AFTER the PIO host port is up.
+    """
     # ---------------------------------------------------------------- power
 
-    # GP5 drives the dual-transistor (NPN + PN2907A) high-side switch feeding
-    # 5V to the USB breakout. High = YubiKey powered, low/hi-Z = unpowered.
-    # At raw boot and during BOOTSEL/flashing the pin floats, so the YubiKey is
-    # unpowered until this code deliberately powers it - which sidesteps the
-    # CircuitPython cold-boot bug (#8886: a device attached around host-stack
-    # init is never enumerated) because we only energize the device AFTER the
-    # host port is initialized.
-    power = digitalio.DigitalInOut(board.GP5)
+    # Pin wiring: PIN_POWER / PIN_SIM_TOUCH in config.py.
+    power = digitalio.DigitalInOut(PIN_POWER)
     power.direction = digitalio.Direction.OUTPUT
 
-    # GP15 drives the YubiKey's touch input: low = touch active, high = none.
-    # Held high from boot (and the key is unpowered until GP5 enables it), so
-    # the key never sees a phantom touch while the firmware boots.
-    sim_touch = digitalio.DigitalInOut(board.GP15)
+    # Held high from boot (and the key is unpowered until PIN_POWER enables
+    # it), so the key never sees a phantom touch while the firmware boots.
+    sim_touch = digitalio.DigitalInOut(PIN_SIM_TOUCH)
     sim_touch.direction = digitalio.Direction.OUTPUT
     sim_touch.value = True
 
-
     def yubikey_power(on):
         power.value = on
-
 
     # Boot sequence: force a clean downstream state, then init the host port,
     # then attach the device. The power-off also clears a device left wedged
@@ -91,13 +101,13 @@ def main(is_debug=False):
     # without this switch).
     yubikey_power(False)
     time.sleep(1.0)
-    usb_host.Port(board.GP16, board.GP17)
+    usb_host.Port(PIN_USB_DP, PIN_USB_DM)
     time.sleep(0.1)
     yubikey_power(True)
 
     # Onboard LED status: slow blink = waiting for YubiKey (or power-cycling
     # it), fast blink = YubiKey waiting for a user touch, solid = relaying.
-    led = digitalio.DigitalInOut(board.LED)
+    led = digitalio.DigitalInOut(PIN_LED)
     led.direction = digitalio.Direction.OUTPUT
 
     # ---------------------------------------------------------------- upstream
@@ -116,6 +126,11 @@ def main(is_debug=False):
 
     print("upstream:", "CTAPHID" if ctap_upstream else "keyboard", "ready")
 
+    return sim_touch, led, yubikey_power, kbd_upstream, ctap_upstream
+
+
+def main(is_debug=False):
+    sim_touch, led, yubikey_power, kbd_upstream, ctap_upstream = init()
 
     # -------------------------------------------------------------- downstream
 
@@ -228,21 +243,7 @@ def main(is_debug=False):
     kbd_buf = array.array("B", [0] * KBD_REPORT_LEN)
     ctap_buf = array.array("B", [0] * CTAP_REPORT_LEN)
 
-    # Timing model (all derived from CTAPHID's request-response structure):
-    # - The PC's HID endpoints use bInterval=8ms and CircuitPython's usb_hid
-    #   buffers only the LATEST OUT report, so while the host is streaming a
-    #   multi-packet request the loop must stay well under 8ms (short reads).
-    # - Once the request is complete, the host goes quiet and the YubiKey
-    #   answers within a few ms. A short read would abort the in-flight
-    #   transfer right as the data lands (corrupting the stream), so the
-    #   read window opens to 50ms until the response arrives or times out.
-    # - IN data is held by the YubiKey until polled: expired reads cost
-    #   latency, never a packet.
-    IDLE_MS = 2
-    RESP_MS = 50
-    INIT_DATA_MAX = 57   # payload bytes in an INIT-type packet (64 - 7 header)
-    CONT_DATA_MAX = 59   # payload bytes in a continuation packet (64 - 5 header)
-
+    # Timing model and read-window values: config.py (IDLE_MS/RESP_MS).
 
     def conts_expected(bcnt):
         """CONT packets a side must still send for a bcnt-byte message."""
@@ -255,32 +256,8 @@ def main(is_debug=False):
     # ------------------------------------------------- CTAP2 message hooks
     # The message-layer proxy (plan.md §5.1) reassembles CTAPHID CBOR (0x90)
     # messages in both directions and hands complete messages to these hooks
-    # before re-packetizing.
-    #
-    # Auto-UV master switch (plan.md). Phase 2: the GetInfo persona is
-    # always on when True. Phase 3 will gate this on the daemon holding a
-    # live pinUvAuthToken instead (safe fallback: persona off -> normal
-    # Chrome PIN prompts).
-    #
-    # PERSONA EFFECT (plan.md §5.2): GetInfo responses are rewritten so the
-    # host sees a biometric key - clientPin removed, uv:true added. Chrome
-    # then never shows a PIN dialog and sends options {uv:true} with no
-    # pinUvAuthParam; until the phase-4 injector exists, the real key
-    # rejects that option (UNSUPPORTED_OPTION) on UV-required / discoverable
-    # flows, while UV-preferred flows work touch-only (UV=false).
-    AUTOUV = True
-
-    # Injector policy (plan.md §5.3): "follow" injects pinUvAuthParam only when
-    # the request carries options.uv:true (Chrome's UV-required / discoverable
-    # shape); "always" injects on every makeCredential/getAssertion.
-    UV_POLICY = "follow"
-
-    # Injector RP-ID allowlist (plan.md §6, review finding): when non-empty,
-    # pinUvAuthParam injection only happens for these RP IDs - everything else
-    # degrades to touch-only (UV=false). The token itself cannot be scoped on
-    # this firmware (fw 5.4.3 rejects scoped tokens, phase-0 P2b), so this is the
-    # only rpId-level restriction available. Empty tuple = inject for any RP.
-    UV_RPIDS = ()
+    # before re-packetizing. Persona/injector switches: config.py
+    # (AUTOUV, UV_POLICY, UV_RPIDS).
 
     # Phase-3 token service (plan.md §5.4): the persona is gated on a live
     # pinUvAuthToken pushed by the host daemon over the CDC data port — the
@@ -295,12 +272,12 @@ def main(is_debug=False):
     # the console on anomaly signatures (orphaned CONT packets, CTAPHID errors,
     # fault-handler entry). Prints per packet would perturb the very races
     # being hunted, so the ring stores bytes and formats only on dump.
+    # Depth: RING_MAX in config.py.
     _ring = []
-    _RING_MAX = 48
 
 
     def _ring_log(tag, b4):
-        if len(_ring) >= _RING_MAX:
+        if len(_ring) >= RING_MAX:
             _ring.pop(0)
         _ring.append((tag, bytes(b4)))
 

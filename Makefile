@@ -39,16 +39,18 @@ deploy: ## Copy firmware sources (boot.py, code.py, lib/) to CIRCUITPY
 		echo "CIRCUITPY drive not found at $(CIRCUITPY)"; \
 		echo "Is the Pico plugged in and running CircuitPython?"; \
 		exit 1; }
-	@cp src/boot.py src/code.py "$(CIRCUITPY)/"
+	@cp src/boot.py src/code.py src/config.py "$(CIRCUITPY)/"
 	@mkdir -p "$(CIRCUITPY)/lib"
 	@cp src/lib/*.py "$(CIRCUITPY)/lib/"
 	@sync
 	@echo "Deployed. code.py auto-reloads; boot.py changes also need: make reset"
 
-deploy-debug: ## Deploy code.py with packet tracing (IS_DEBUG=True) as code.py
+deploy-debug: ## Deploy with packet tracing (flips IS_DEBUG in the deployed config.py)
 	@test -d "$(CIRCUITPY)" || { echo "CIRCUITPY not mounted at $(CIRCUITPY)"; exit 1; }
-	@cp src/code.py "$(CIRCUITPY)/code.py"
-	@sed -i 's/^IS_DEBUG = False/IS_DEBUG = True/' "$(CIRCUITPY)/code.py"
+	@cp src/boot.py src/code.py src/config.py "$(CIRCUITPY)/"
+	@mkdir -p "$(CIRCUITPY)/lib"
+	@cp src/lib/*.py "$(CIRCUITPY)/lib/"
+	@sed -i 's/^IS_DEBUG = False/IS_DEBUG = True/' "$(CIRCUITPY)/config.py"
 	@sync
 	@echo "WARNING: tracing mode deployed - it logs CTAPHID packet headers"
 	@echo "to the serial console. Redeploy production code with: make deploy"
