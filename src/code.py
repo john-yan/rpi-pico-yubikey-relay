@@ -129,6 +129,77 @@ def init():
     return sim_touch, led, yubikey_power, kbd_upstream, ctap_upstream
 
 
+# ------------------------------------------------------------ auto-touch FSM
+
+class TouchFSM:
+    """Auto-touch state machine: observes the key's touch prompts and
+    actuates the simulated finger (PIN_SIM_TOUCH).
+
+    States:
+      IDLE  - nothing waiting; finger is off
+      ARMED - first status-2 KEEPALIVE of a ceremony seen; counting down
+              (AUTO_TOUCH_DELAY) to the simulated finger
+      HOLD  - finger down; the hold always runs its full course
+              (AUTO_TOUCH_HOLD), even when the ceremony completes early,
+              so the next ceremony gets a fresh touch edge
+
+    Transitions:
+      arm()    KEEPALIVE(status=2) - only from IDLE with no pending wait
+      answer() any INIT-type response packet - the ceremony was answered
+               or cancelled; stops the countdown (a stray "processing"
+               keepalive cannot restart it)
+      poll()   time-driven actuation, called once per loop iteration
+
+    One shot per ceremony; a physical touch still works at any time.
+    """
+
+    IDLE = 0
+    ARMED = 1
+    HOLD = 2
+
+    def __init__(self, sim_touch):
+        self.sim_touch = sim_touch
+        self.state = self.IDLE
+        self.pending = False  # ceremony still awaits a finger
+        self.armed_at = 0.0
+
+    def arm(self):
+        # Arm only from IDLE with no pending wait: arming during a HOLD
+        # would overwrite it and leave the pin stuck low (no fresh touch
+        # edge for the next ceremony -> ACTION_TIMEOUT). Pre-existing race
+        # surfaced by unattended back-to-back ceremonies; fixed during the
+        # Phase-1 proxy work.
+        if not self.pending and self.state == self.IDLE:
+            self.pending = True
+            self.state = self.ARMED
+            self.armed_at = time.monotonic()
+
+    def answer(self):
+        self.pending = False
+
+    def poll(self):
+        now = time.monotonic()
+        if self.state == self.HOLD:
+            if now - self.armed_at >= AUTO_TOUCH_DELAY + AUTO_TOUCH_HOLD:
+                self.sim_touch.value = True  # finger off
+                self.state = self.IDLE
+        elif self.pending:
+            if self.state == self.ARMED and now - self.armed_at >= AUTO_TOUCH_DELAY:
+                self.sim_touch.value = False  # finger on
+                self.state = self.HOLD
+        else:
+            self.state = self.IDLE  # ceremony over: re-arm for the next one
+
+
+# ----------------------------------------------- loss-recovery FSM states
+# After a lost response packet (downstream read race) the remaining CONTs
+# of that message are unrecoverable wreckage: the client already got a
+# clean CTAPHID ERROR (INVALID_SEQ) it can retry from. Transitions live
+# in recover_lost_response() / the swallow check in the session loop.
+RECOVER_NORMAL = 0  # relay everything
+RECOVER_SWALLOW = 1  # consume the strays; any INIT-type packet ends it
+
+
 def main(is_debug=False):
     sim_touch, led, yubikey_power, kbd_upstream, ctap_upstream = init()
 
@@ -350,385 +421,427 @@ def main(is_debug=False):
         return message
 
 
+    # ---- link lifecycle state machine (outer loop) ----
+    # ATTACH_WAIT : no downstream device; wait_for_yubikey blocks here
+    #               (slow LED blink, power-cycle self-heal).
+    # RELAY       : device attached; run_session runs one attach epoch
+    #               until a bus fault or disconnect raises out of it.
+    # RECOVER     : recover_from_fault tears the session down - counts
+    #               teardowns, power-cycles the key after repeated faults -
+    #               then the loop falls back to ATTACH_WAIT.
+    # (The try/except IS the RELAY -> RECOVER transition; the bottom of
+    # the while is the RECOVER -> ATTACH_WAIT transition.)
+    #
     # Consecutive fault teardowns across attach epochs; reset only when a
     # session proves stable, so an enumerable-but-wedged device gets power-
     # cycled after three rapid faults instead of looping forever.
     teardowns = 0
+    attached_at = 0.0  # set at each attach; read by the fault handler
+    last_op = ["init"]  # fault attribution: which call raised (see run_session)
+
+    def run_session(dev, kbd_ep, ctap_in, ctap_out):
+        """LINK_RELAY state body: one attach epoch of the relay loop.
+
+        Never returns: runs until a bus fault or disconnect raises
+        (usb.core.USBError / OSError), which the link lifecycle catches.
+        """
+        # The daemon rides the CDC data port (ttyACM1, enabled in boot.py);
+        # stays None when the port is not enabled.
+        # Hoisted bound methods: cuts per-iteration overhead on the RP2040.
+        # CTAPHID entries stay None in keyboard mode (boot.py MODE="keyboard").
+        get_report = (
+            ctap_upstream.get_last_received_report
+            if ctap_upstream is not None
+            else None
+        )
+        ctap_send = (
+            ctap_upstream.send_report if ctap_upstream is not None else None
+        )
+        ctap_read = dev.read
+        ctap_write = dev.write
+
+        # Single funnel points for every CTAPHID packet sent downstream or
+        # upstream (verbatim relays and proxy re-emissions alike); the
+        # is_debug tracing mode instruments exactly these two.
+        def send_downstream(pkt):
+            _ring_log("F>", pkt[4:8])
+            # A transient NAK/stall on the PIO bus can make dev.write raise
+            # an empty-message USBError (observed on proxy re-emission
+            # bursts); tearing the session down for it kills in-flight
+            # ceremonies. Retry with backoff instead - only a genuinely
+            # dead bus exhausts the attempts and re-raises to the outer
+            # fault handler.
+            for attempt in range(3):
+                last_op[0] = "write_down"
+                try:
+                    ctap_write(ctap_out, pkt, timeout=100)
+                    if is_debug:
+                        print("F>YK:", " ".join("{:02x}".format(b) for b in pkt[:8]))
+                    return
+                except usb.core.USBError:
+                    _ring_log("F!", pkt[4:8])  # retried downstream write
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.01)
+
+        def send_upstream(pkt):
+            _ring_log("Y>", pkt[4:8])
+            last_op[0] = "send_up"
+            try:
+                ctap_send(pkt)
+                if is_debug:
+                    print("Y>PC:", " ".join("{:02x}".format(b) for b in pkt[:8]))
+            except OSError:
+                # One retry: the native USB stack can transiently refuse a
+                # back-to-back send_report on the re-emission burst.
+                # Ring-tagged ("Y!") so a retried-and-possibly-lost packet
+                # stays visible in failure forensics.
+                _ring_log("Y!", pkt[4:8])
+                time.sleep(0.005)
+                last_op[0] = "send_up_retry"
+                ctap_send(pkt)
+
+        # ---- read-window state machine (read_ms) ----
+        # DRAIN (win_drain): no reply due - short read timeout
+        # (IDLE_MS) so the PC's OUT-report drain is never starved.
+        # RESPONSE (win_expect): a reply is due from the key - hold
+        # the read open (RESP_MS) so a short-timeout abort can never
+        # land exactly as data arrives and corrupt the transfer.
+        def win_drain():
+            nonlocal read_ms
+            read_ms = IDLE_MS
+
+        def win_expect(reply_due=True):
+            nonlocal read_ms
+            read_ms = RESP_MS if reply_due else IDLE_MS
+
+        # ---- loss-recovery transition into RECOVER_SWALLOW ----
+        def recover_lost_response(reason, pkt):
+            """A response packet was lost (orphan CONT, or a BYPASS on
+            an active assembly): the message is unrecoverable. Tell the
+            client with a clean CTAPHID ERROR (INVALID_SEQ) it can
+            retry from, and swallow the remaining CONTs instead of
+            leaking them (which surfaces as a confusing
+            INVALID_COMMAND at the client)."""
+            nonlocal recover
+            _ring_dump(reason + " - INVALID_SEQ sent")
+            _pending_req.pop(_cid_of(pkt), None)
+            recover = RECOVER_SWALLOW
+            err = bytearray(CTAP_REPORT_LEN)
+            err[0] = pkt[0]
+            err[1] = pkt[1]
+            err[2] = pkt[2]
+            err[3] = pkt[3]
+            err[4] = 0xBF  # CTAPHID ERROR
+            err[5] = 0
+            err[6] = 1
+            err[7] = 0x04  # INVALID_SEQ
+            send_upstream(err)
+
+        # CTAP2/CBOR message-layer state, one in-flight message per
+        # direction (see ctaphid_proxy.py for the limitation rationale).
+        req_asm = ctaphid_proxy.CtapAssembler()   # PC -> YubiKey
+        resp_asm = ctaphid_proxy.CtapAssembler()  # YubiKey -> PC
+
+        # Broker writes go through the same hardened downstream funnel.
+        token_svc.sender = send_downstream
+        token_svc.port = usb_cdc.data
+
+        # Fault attribution: the link fault handler reports which call
+        # raised (str(e) is often empty for usb.core.USBError/OSError).
+        last_op[0] = "init"
+
+        pending_conts = 0  # CONT packets the host still owes for this message
+        resp_pending = 0  # CONT packets the YubiKey still owes for its response
+        touch = TouchFSM(sim_touch)  # fresh state: the key just (re)attached
+        read_ms = IDLE_MS  # read-window state (win_drain/win_expect below)
+        read_errors = 0  # consecutive spurious USBErrors on downstream reads
+        recover = RECOVER_NORMAL  # loss-recovery state (RECOVER_*)
+
+        def tick_broker():
+            # Daemon commands, broker timeouts, heartbeats: the CDC control
+            # plane. (The broker DATA plane rides tick_downstream, inside
+            # token_svc.consume().)
+            token_svc.poll()
+
+        def tick_upstream():
+            # PC -> YubiKey: drain ALL pending CTAPHID OUT reports.
+            # Ordering invariant I2 (tick-table.md): runs before the
+            # downstream read so the 8 ms bInterval drain deadline never
+            # queues behind the response window.
+            nonlocal pending_conts
+            if get_report is not None:
+                while True:
+                    report = get_report()
+                    if report is None:
+                        break
+                    cmd_byte = report[4]
+                    _ring_log(">", report[4:8])
+                    if not cmd_byte & 0x80 and not req_asm.active and not pending_conts:
+                        # Orphaned host CONT: the PC is streaming a request
+                        # continuation with no assembly and no verbatim
+                        # message pending - an INIT was lost (only-latest OUT
+                        # buffer). The key would then wait forever on a
+                        # truncated request.
+                        _ring_dump("orphan request CONT")
+                    handled = False
+                    if cmd_byte == CMD_CBOR or (
+                        req_asm.active and not cmd_byte & 0x80
+                    ):
+                        # CTAP2/CBOR: message-layer proxy. The reassembled
+                        # message passes through cbor_request_hook (identity
+                        # in Phase 1) and is re-packetized canonically.
+                        r = req_asm.feed(report)
+                        if r is None:
+                            # host still streaming CONTs: drain priority
+                            win_drain()
+                            handled = True
+                        elif r is not ctaphid_proxy.BYPASS:
+                            cid, msg = r
+                            msg = cbor_request_hook(cid, msg)
+                            for pkt in ctaphid_proxy.packetize(cid, msg):
+                                send_downstream(pkt)
+                            # request complete (or single-packet): reply due
+                            win_expect()
+                            handled = True
+                    if not handled:
+                        # Any other command (or a proxy bypass): verbatim.
+                        last_op[0] = "write_down_verbatim"
+                        send_downstream(report)
+                        if cmd_byte & 0x80:  # INIT-type packet: bcnt in header
+                            pending_conts = conts_expected(
+                                (report[5] << 8) | report[6]
+                            )
+                        else:  # continuation packet
+                            if pending_conts > 0:
+                                pending_conts -= 1
+                        if pending_conts == 0:
+                            # request complete (or single-packet): expect a
+                            # reply
+                            win_expect()
+                        else:
+                            # host still streaming CONTs: drain priority
+                            win_drain()
+
+        def tick_downstream():
+            # YubiKey -> PC: CTAPHID IN reports. Ordering invariant I3
+            # (tick-table.md): the whole per-packet dispatch pipeline is
+            # this ONE tick - broker consume, swallow check, orphan
+            # detection, assembler, verbatim relay, touch observation are
+            # ordered STAGES over one packet, not separate tasks.
+            nonlocal read_errors, recover, resp_pending
+            if ctap_in is not None:
+                # A short read timeout aborts the in-flight transfer, and if
+                # that lands exactly as data arrives, TinyUSB reports
+                # ABORTED instead of a clean timeout - a bare USBError even
+                # though the device is fine. Retry a few times before
+                # tearing down; only persistent errors mean a real fault.
+                try:
+                    last_op[0] = "read"
+                    n = ctap_read(
+                        ctap_in, ctap_buf, timeout=read_ms, raise_on_timeout=False
+                    )
+                except usb.core.USBError:
+                    read_errors += 1
+                    if read_errors > 5:
+                        raise  # genuine fault: re-enumerate (and self-heal)
+                    # Was `continue` (skip the loop's remaining steps for
+                    # this pass); as a tick it is an early return - the
+                    # keyboard/touch/LED ticks still run this pass, which is
+                    # harmless (their deadlines are 10 ms - 1 s scale).
+                    return
+                read_errors = 0
+                # Interrupt IN packets are atomic: only ever forward full
+                # 64-byte reports, never a short read padded with stale bytes.
+                if n == CTAP_REPORT_LEN:
+                    if is_debug:
+                        print("YK>>:", " ".join("{:02x}".format(b) for b in ctap_buf[:8]))
+                    cmd_byte = ctap_buf[4]
+                    _ring_log("<", ctap_buf[4:8])
+                    # Broker/private-channel traffic first: consumed packets
+                    # never reach the PC, the orphan detectors, or the touch
+                    # state machine (a broker response INIT must not clear a
+                    # concurrent Chrome touch-wait).
+                    brokered = token_svc.consume(ctap_buf)
+                    if brokered:
+                        win_expect(token_svc.waiting())
+                    if not brokered and recover == RECOVER_SWALLOW:
+                        # Swallowing stray CONTs of a response whose INIT or
+                        # sibling CONT was lost on the downstream read race
+                        # (see recover_lost_response). Any INIT-type packet
+                        # ends the swallow and resumes normal relaying.
+                        if not cmd_byte & 0x80:
+                            _ring_log("XX", ctap_buf[4:8])
+                            brokered = True  # consumed: skip all relay handling
+                        else:
+                            recover = RECOVER_NORMAL  # next message begins
+                    if not brokered and (
+                        not cmd_byte & 0x80
+                        and not resp_asm.active
+                        and not resp_pending
+                    ):
+                        # Orphaned CONT: the key is streaming a continuation
+                        # with no response assembly in progress and no
+                        # verbatim message pending either - a downstream
+                        # packet was lost (read-abort race on the PIO bus).
+                        recover_lost_response("lost response packet", ctap_buf)
+                        brokered = True  # this CONT is part of the wreckage
+                    if not brokered and cmd_byte == 0xBF:
+                        _ring_dump("CTAPHID error from key")
+                        _pending_req.pop(_cid_of(ctap_buf), None)
+                    handled = False
+                    if not brokered and (
+                        cmd_byte == CMD_CBOR
+                        or (resp_asm.active and not cmd_byte & 0x80)
+                    ):
+                        # CTAP2/CBOR: message-layer proxy. The reassembled
+                        # response passes through cbor_response_hook
+                        # (identity in Phase 1) before going upstream.
+                        was_active = resp_asm.active
+                        r = resp_asm.feed(ctap_buf)
+                        if r is None:
+                            # response CONTs still due: stay open
+                            win_expect()
+                            handled = True
+                        elif r is not ctaphid_proxy.BYPASS:
+                            cid, msg = r
+                            msg = cbor_response_hook(cid, msg)
+                            for pkt in ctaphid_proxy.packetize(cid, msg):
+                                send_upstream(pkt)
+                            win_drain()  # transaction complete
+                            handled = True
+                        elif was_active and not cmd_byte & 0x80:
+                            # BYPASS on a CONT that belonged to an active
+                            # assembly: a sibling CONT was lost mid-message.
+                            # Same recovery as the orphan path above.
+                            recover_lost_response("lost mid-response CONT", ctap_buf)
+                            handled = True
+                    if not brokered and not handled:
+                        # Any other command (or a proxy bypass): verbatim.
+                        # Broker packets are excluded TWICE (here and in the
+                        # dispatch above): leaking one into send_upstream
+                        # with no hidraw reader blocks the main loop 2s per
+                        # packet in send_report, then tears the session down
+                        # (the phase-3/4 refactor briefly regressed this and
+                        # killed daemon acquisitions with no reader active).
+                        last_op[0] = "send_up_verbatim"
+                        send_upstream(ctap_buf)
+                        if cmd_byte & 0x80:  # response INIT packet
+                            resp_pending = conts_expected(
+                                (ctap_buf[5] << 8) | ctap_buf[6]
+                            )
+                        else:  # response continuation packet
+                            if resp_pending > 0:
+                                resp_pending -= 1
+                        # stay open only while response CONTs are still due;
+                        # once the transaction completes, return to drain
+                        # priority so the next request is never starved.
+                        win_expect(resp_pending)
+                    # Touch detection (observation only, no protocol
+                    # change): a KEEPALIVE (cmd 0x3B -> 0xBB on the wire)
+                    # with status 0x02 means the key is waiting for user
+                    # presence; any other response packet means the
+                    # ceremony was answered (or cancelled). The first
+                    # status-2 KEEPALIVE arms the auto-touch timer; only
+                    # a response clears it, so a stray "processing"
+                    # keepalive cannot restart the countdown.
+                    # MUST run for relay-path packets regardless of proxy
+                    # dispatch: CBOR responses set handled=True while being
+                    # reassembled, and a response INIT that fails to reach
+                    # touch.answer() here leaves the wait stuck - back-to-back
+                    # ceremonies on one channel then never re-arm (phase-2
+                    # regression caught by the phase-4 UV probes; luci masked
+                    # it because every plugin run starts with a CTAPHID INIT
+                    # that cleared it). Only broker traffic is excluded.
+                    if not brokered:
+                        # Touch detection (observation only, no protocol
+                        # change): a status-2 KEEPALIVE arms the auto-touch
+                        # timer; any INIT-type response packet means the
+                        # ceremony was answered (or cancelled). Guards and
+                        # race notes: TouchFSM.arm()/answer().
+                        if cmd_byte == 0xBB:
+                            if ctap_buf[7] == 2:
+                                touch.arm()
+                        elif cmd_byte & 0x80:
+                            touch.answer()
+                else:
+                    win_drain()  # window expired - back to drain priority
+
+        def tick_keyboard():
+            # YubiKey -> PC: OTP keyboard reports (keyboard mode only).
+            # Invariant I5: the 10 ms blocking read is acceptable only
+            # because keyboard and CTAPHID modes are mutually exclusive.
+            if kbd_ep is not None:
+                n = dev.read(kbd_ep, kbd_buf, timeout=10, raise_on_timeout=False)
+                if n:
+                    for i in range(n, KBD_REPORT_LEN):
+                        kbd_buf[i] = 0
+                    kbd_upstream.send_report(kbd_buf)
+
+        def tick_touch():
+            # Auto-touch actuation (state machine: TouchFSM above).
+            touch.poll()
+
+        def tick_led():
+            # LED: solid = relaying, fast blink (~8 Hz) = waiting for touch.
+            # Wall-clock based, so the poll loop is never blocked.
+            led.value = (not touch.pending) or bool(int(time.monotonic() * 8) & 1)
+
+        # Fixed-priority tick table (tick-table.md): dispatch order IS
+        # priority. The ordering invariants are I1-I5 there - reordering
+        # is a behavior change and needs the full verification matrix.
+        TICKS = (
+            ("broker", tick_broker),
+            ("upstream", tick_upstream),
+            ("downstream", tick_downstream),
+            ("keyboard", tick_keyboard),
+            ("touch", tick_touch),
+            ("led", tick_led),
+        )
+
+        while True:
+            for name, tick in TICKS:
+                last_op[0] = name  # tick-granularity fault attribution;
+                tick()             # funnel tags overwrite with finer detail
+
+
+    def recover_from_fault(e):
+        """LINK_RECOVER state body: bus error or disconnect teardown.
+
+        A device that still enumerates but keeps failing would otherwise
+        re-attach instantly and loop; power-cycle it after repeated faults.
+        """
+        nonlocal teardowns
+        if time.monotonic() - attached_at > 5.0:
+            teardowns = 0  # the session was stable for a while - not a wedge
+        teardowns += 1
+        try:
+            import sys
+
+            sys.print_exception(e)  # full traceback (str(e) is often empty)
+        except Exception:
+            pass
+        _ring_dump("fault at " + last_op[0])
+        print("relay error at", last_op[0], ":", e, "- re-enumerating")
+        if teardowns >= 3:
+            print("repeated faults - power-cycling YubiKey")
+            yubikey_power(False)
+            time.sleep(1.0)
+            yubikey_power(True)
+            teardowns = 0
 
     while True:
+        # ---- LINK_ATTACH_WAIT: block until a relay-able device attaches
         dev, kbd_ep, ctap_in, ctap_out = wait_for_yubikey()
         led.value = True  # solid: relay active
         attached_at = time.monotonic()
         token_svc.on_attach()  # tokens died with the key's power cycle
 
+        # ---- LINK_RELAY -> LINK_RECOVER on any bus fault or disconnect
         try:
-            # The daemon rides the CDC data port (ttyACM1, enabled in boot.py);
-            # stays None when the port is not enabled.
-            # Hoisted bound methods: cuts per-iteration overhead on the RP2040.
-            # CTAPHID entries stay None in keyboard mode (boot.py MODE="keyboard").
-            get_report = (
-                ctap_upstream.get_last_received_report
-                if ctap_upstream is not None
-                else None
-            )
-            ctap_send = (
-                ctap_upstream.send_report if ctap_upstream is not None else None
-            )
-            ctap_read = dev.read
-            ctap_write = dev.write
-
-            # Single funnel points for every CTAPHID packet sent downstream or
-            # upstream (verbatim relays and proxy re-emissions alike); the
-            # is_debug tracing mode instruments exactly these two.
-            def send_downstream(pkt):
-                _ring_log("F>", pkt[4:8])
-                # A transient NAK/stall on the PIO bus can make dev.write raise
-                # an empty-message USBError (observed on proxy re-emission
-                # bursts); tearing the session down for it kills in-flight
-                # ceremonies. Retry with backoff instead - only a genuinely
-                # dead bus exhausts the attempts and re-raises to the outer
-                # fault handler.
-                for attempt in range(3):
-                    last_op[0] = "write_down"
-                    try:
-                        ctap_write(ctap_out, pkt, timeout=100)
-                        if is_debug:
-                            print("F>YK:", " ".join("{:02x}".format(b) for b in pkt[:8]))
-                        return
-                    except usb.core.USBError:
-                        _ring_log("F!", pkt[4:8])  # retried downstream write
-                        if attempt == 2:
-                            raise
-                        time.sleep(0.01)
-
-            def send_upstream(pkt):
-                _ring_log("Y>", pkt[4:8])
-                last_op[0] = "send_up"
-                try:
-                    ctap_send(pkt)
-                    if is_debug:
-                        print("Y>PC:", " ".join("{:02x}".format(b) for b in pkt[:8]))
-                except OSError:
-                    # One retry: the native USB stack can transiently refuse a
-                    # back-to-back send_report on the re-emission burst.
-                    # Ring-tagged ("Y!") so a retried-and-possibly-lost packet
-                    # stays visible in failure forensics.
-                    _ring_log("Y!", pkt[4:8])
-                    time.sleep(0.005)
-                    last_op[0] = "send_up_retry"
-                    ctap_send(pkt)
-
-            # CTAP2/CBOR message-layer state, one in-flight message per
-            # direction (see ctaphid_proxy.py for the limitation rationale).
-            req_asm = ctaphid_proxy.CtapAssembler()   # PC -> YubiKey
-            resp_asm = ctaphid_proxy.CtapAssembler()  # YubiKey -> PC
-
-            # Broker writes go through the same hardened downstream funnel.
-            token_svc.sender = send_downstream
-            token_svc.port = usb_cdc.data
-
-            # Fault attribution: the outer handler reports which call raised
-            # (str(e) is often empty for usb.core.USBError/OSError).
-            last_op = ["init"]
-
-            pending_conts = 0  # CONT packets the host still owes for this message
-            resp_pending = 0  # CONT packets the YubiKey still owes for its response
-            touch_pending = False  # KEEPALIVE reports the key awaits a finger
-            touch_phase = 0  # auto-touch: 0 idle, 1 countdown, 2 touching, 3 done
-            touch_start = 0.0  # monotonic time of the first waiting KEEPALIVE
-            read_ms = IDLE_MS
-            read_errors = 0  # consecutive spurious USBErrors on downstream reads
-            drop_stray_conts = False  # swallowing CONTs of a lost response
-
-            while True:
-                # 0) token service: daemon commands, broker timeouts, heartbeats
-                token_svc.poll()
-
-                # 1) PC -> YubiKey : drain ALL pending CTAPHID OUT reports.
-                if get_report is not None:
-                    while True:
-                        report = get_report()
-                        if report is None:
-                            break
-                        cmd_byte = report[4]
-                        _ring_log(">", report[4:8])
-                        if not cmd_byte & 0x80 and not req_asm.active and not pending_conts:
-                            # Orphaned host CONT: the PC is streaming a request
-                            # continuation with no assembly and no verbatim
-                            # message pending - an INIT was lost (only-latest OUT
-                            # buffer). The key would then wait forever on a
-                            # truncated request.
-                            _ring_dump("orphan request CONT")
-                        handled = False
-                        if cmd_byte == CMD_CBOR or (
-                            req_asm.active and not cmd_byte & 0x80
-                        ):
-                            # CTAP2/CBOR: message-layer proxy. The reassembled
-                            # message passes through cbor_request_hook (identity
-                            # in Phase 1) and is re-packetized canonically.
-                            r = req_asm.feed(report)
-                            if r is None:
-                                # host still streaming CONTs: drain priority
-                                read_ms = IDLE_MS
-                                handled = True
-                            elif r is not ctaphid_proxy.BYPASS:
-                                cid, msg = r
-                                msg = cbor_request_hook(cid, msg)
-                                for pkt in ctaphid_proxy.packetize(cid, msg):
-                                    send_downstream(pkt)
-                                # request complete (or single-packet): reply due
-                                read_ms = RESP_MS
-                                handled = True
-                        if not handled:
-                            # Any other command (or a proxy bypass): verbatim.
-                            last_op[0] = "write_down_verbatim"
-                            send_downstream(report)
-                            if cmd_byte & 0x80:  # INIT-type packet: bcnt in header
-                                pending_conts = conts_expected(
-                                    (report[5] << 8) | report[6]
-                                )
-                            else:  # continuation packet
-                                if pending_conts > 0:
-                                    pending_conts -= 1
-                            if pending_conts == 0:
-                                # request complete (or single-packet): expect a
-                                # reply
-                                read_ms = RESP_MS
-                            else:
-                                # host still streaming CONTs: drain priority
-                                read_ms = IDLE_MS
-
-                # 2) YubiKey -> PC : CTAPHID IN reports (forward verbatim).
-                if ctap_in is not None:
-                    # A short read timeout aborts the in-flight transfer, and if
-                    # that lands exactly as data arrives, TinyUSB reports
-                    # ABORTED instead of a clean timeout - a bare USBError even
-                    # though the device is fine. Retry a few times before
-                    # tearing down; only persistent errors mean a real fault.
-                    try:
-                        last_op[0] = "read"
-                        n = ctap_read(
-                            ctap_in, ctap_buf, timeout=read_ms, raise_on_timeout=False
-                        )
-                    except usb.core.USBError:
-                        read_errors += 1
-                        if read_errors > 5:
-                            raise  # genuine fault: re-enumerate (and self-heal)
-                        continue
-                    read_errors = 0
-                    # Interrupt IN packets are atomic: only ever forward full
-                    # 64-byte reports, never a short read padded with stale bytes.
-                    if n == CTAP_REPORT_LEN:
-                        if is_debug:
-                            print("YK>>:", " ".join("{:02x}".format(b) for b in ctap_buf[:8]))
-                        cmd_byte = ctap_buf[4]
-                        _ring_log("<", ctap_buf[4:8])
-                        # Broker/private-channel traffic first: consumed packets
-                        # never reach the PC, the orphan detectors, or the touch
-                        # state machine (a broker response INIT must not clear a
-                        # concurrent Chrome touch-wait).
-                        brokered = token_svc.consume(ctap_buf)
-                        if brokered:
-                            read_ms = RESP_MS if token_svc.waiting() else IDLE_MS
-                        if (
-                            not brokered
-                            and drop_stray_conts
-                            and not cmd_byte & 0x80
-                        ):
-                            # Swallowing stray CONTs of a response whose INIT or
-                            # sibling CONT was lost on the downstream read race:
-                            # the message is unrecoverable, the client already got
-                            # a clean CTAPHID ERROR (INVALID_SEQ). Any INIT-type
-                            # packet ends the swallow and resumes normal relaying.
-                            _ring_log("XX", ctap_buf[4:8])
-                            brokered = True  # consumed: skip all relay handling
-                        elif not brokered and drop_stray_conts:
-                            drop_stray_conts = False  # next message begins
-                        if not brokered and (
-                            not cmd_byte & 0x80
-                            and not resp_asm.active
-                            and not resp_pending
-                        ):
-                            # Orphaned CONT: the key is streaming a continuation
-                            # with no response assembly in progress and no
-                            # verbatim message pending either - a downstream
-                            # packet was lost (read-abort race on the PIO bus).
-                            # The message is unrecoverable: tell the client with
-                            # a clean CTAPHID ERROR (INVALID_SEQ) it can retry
-                            # from, and swallow the remaining CONTs, instead of
-                            # leaking them (which surfaces as a confusing
-                            # INVALID_COMMAND at the client).
-                            _ring_dump("lost response packet - INVALID_SEQ sent")
-                            _pending_req.pop(_cid_of(ctap_buf), None)
-                            drop_stray_conts = True
-                            err = bytearray(CTAP_REPORT_LEN)
-                            err[0] = ctap_buf[0]
-                            err[1] = ctap_buf[1]
-                            err[2] = ctap_buf[2]
-                            err[3] = ctap_buf[3]
-                            err[4] = 0xBF  # CTAPHID ERROR
-                            err[5] = 0
-                            err[6] = 1
-                            err[7] = 0x04  # INVALID_SEQ
-                            send_upstream(err)
-                            brokered = True  # this CONT is part of the wreckage
-                        if not brokered and cmd_byte == 0xBF:
-                            _ring_dump("CTAPHID error from key")
-                            _pending_req.pop(_cid_of(ctap_buf), None)
-                        handled = False
-                        if not brokered and (
-                            cmd_byte == CMD_CBOR
-                            or (resp_asm.active and not cmd_byte & 0x80)
-                        ):
-                            # CTAP2/CBOR: message-layer proxy. The reassembled
-                            # response passes through cbor_response_hook
-                            # (identity in Phase 1) before going upstream.
-                            was_active = resp_asm.active
-                            r = resp_asm.feed(ctap_buf)
-                            if r is None:
-                                # response CONTs still due: stay open
-                                read_ms = RESP_MS
-                                handled = True
-                            elif r is not ctaphid_proxy.BYPASS:
-                                cid, msg = r
-                                msg = cbor_response_hook(cid, msg)
-                                for pkt in ctaphid_proxy.packetize(cid, msg):
-                                    send_upstream(pkt)
-                                read_ms = IDLE_MS  # transaction complete
-                                handled = True
-                            elif was_active and not cmd_byte & 0x80:
-                                # BYPASS on a CONT that belonged to an active
-                                # assembly: a sibling CONT was lost mid-message.
-                                # Same recovery as the orphan path above.
-                                _ring_dump("lost mid-response CONT - INVALID_SEQ sent")
-                                _pending_req.pop(_cid_of(ctap_buf), None)
-                                drop_stray_conts = True
-                                err = bytearray(CTAP_REPORT_LEN)
-                                err[0] = ctap_buf[0]
-                                err[1] = ctap_buf[1]
-                                err[2] = ctap_buf[2]
-                                err[3] = ctap_buf[3]
-                                err[4] = 0xBF
-                                err[5] = 0
-                                err[6] = 1
-                                err[7] = 0x04
-                                send_upstream(err)
-                                handled = True
-                        if not brokered and not handled:
-                            # Any other command (or a proxy bypass): verbatim.
-                            # Broker packets are excluded TWICE (here and in the
-                            # dispatch above): leaking one into send_upstream
-                            # with no hidraw reader blocks the main loop 2s per
-                            # packet in send_report, then tears the session down
-                            # (the phase-3/4 refactor briefly regressed this and
-                            # killed daemon acquisitions with no reader active).
-                            last_op[0] = "send_up_verbatim"
-                            send_upstream(ctap_buf)
-                            if cmd_byte & 0x80:  # response INIT packet
-                                resp_pending = conts_expected(
-                                    (ctap_buf[5] << 8) | ctap_buf[6]
-                                )
-                            else:  # response continuation packet
-                                if resp_pending > 0:
-                                    resp_pending -= 1
-                            # stay open only while response CONTs are still due;
-                            # once the transaction completes, return to drain
-                            # priority so the next request is never starved.
-                            read_ms = RESP_MS if resp_pending else IDLE_MS
-                        # Touch detection (observation only, no protocol
-                        # change): a KEEPALIVE (cmd 0x3B -> 0xBB on the wire)
-                        # with status 0x02 means the key is waiting for user
-                        # presence; any other response packet means the
-                        # ceremony was answered (or cancelled). The first
-                        # status-2 KEEPALIVE arms the auto-touch timer; only
-                        # a response clears it, so a stray "processing"
-                        # keepalive cannot restart the countdown.
-                        # MUST run for relay-path packets regardless of proxy
-                        # dispatch: CBOR responses set handled=True while being
-                        # reassembled, and a response INIT that fails to clear
-                        # touch_pending here leaves it stuck - back-to-back
-                        # ceremonies on one channel then never re-arm (phase-2
-                        # regression caught by the phase-4 UV probes; luci masked
-                        # it because every plugin run starts with a CTAPHID INIT
-                        # that cleared it). Only broker traffic is excluded.
-                        if not brokered:
-                            if cmd_byte == 0xBB:
-                                # Arm only when no hold is in flight
-                                # (touch_phase == 0): arming during the phase-2
-                                # hold would overwrite it and leave GP15 stuck
-                                # low (no fresh touch edge for the next ceremony
-                                # -> ACTION_TIMEOUT). Pre-existing race, surfaced
-                                # by unattended back-to-back ceremonies; fixed
-                                # during the Phase-1 proxy work.
-                                if (
-                                    ctap_buf[7] == 2
-                                    and not touch_pending
-                                    and touch_phase == 0
-                                ):
-                                    touch_pending = True
-                                    touch_phase = 1
-                                    touch_start = time.monotonic()
-                            elif cmd_byte & 0x80:
-                                touch_pending = False
-                    else:
-                        read_ms = IDLE_MS  # window expired - back to drain priority
-
-                # 3) YubiKey -> PC : OTP keyboard reports (keyboard mode only).
-                if kbd_ep is not None:
-                    n = dev.read(kbd_ep, kbd_buf, timeout=10, raise_on_timeout=False)
-                    if n:
-                        for i in range(n, KBD_REPORT_LEN):
-                            kbd_buf[i] = 0
-                        kbd_upstream.send_report(kbd_buf)
-
-                # Auto-touch: once the key has waited AUTO_TOUCH_DELAY seconds,
-                # simulate the finger for AUTO_TOUCH_HOLD seconds. One shot per
-                # ceremony; a physical touch still works at any time. The hold
-                # always runs its full course, even when the ceremony completes
-                # early (the response clears touch_pending, but GP15 stays low
-                # until AUTO_TOUCH_HOLD has elapsed).
-                if touch_phase == 2:
-                    if (
-                        time.monotonic() - touch_start
-                        >= AUTO_TOUCH_DELAY + AUTO_TOUCH_HOLD
-                    ):
-                        sim_touch.value = True  # finger off
-                        touch_phase = 0
-                elif touch_pending:
-                    if (
-                        touch_phase == 1
-                        and time.monotonic() - touch_start >= AUTO_TOUCH_DELAY
-                    ):
-                        sim_touch.value = False  # finger on
-                        touch_phase = 2
-                else:
-                    touch_phase = 0  # ceremony over: re-arm for the next one
-
-                # LED: solid = relaying, fast blink (~8 Hz) = waiting for touch.
-                # Wall-clock based, so the poll loop is never blocked.
-                led.value = (not touch_pending) or bool(int(time.monotonic() * 8) & 1)
-
+            run_session(dev, kbd_ep, ctap_in, ctap_out)
         except (usb.core.USBError, OSError) as e:
-            # Bus error or disconnect: tear down and re-enumerate (fault tolerance).
-            # A device that still enumerates but keeps failing would otherwise
-            # re-attach instantly and loop; power-cycle it after repeated faults.
-            if time.monotonic() - attached_at > 5.0:
-                teardowns = 0  # the session was stable for a while - not a wedge
-            teardowns += 1
-            try:
-                import sys
-
-                sys.print_exception(e)  # full traceback (str(e) is often empty)
-            except Exception:
-                pass
-            _ring_dump("fault at " + last_op[0])
-            print("relay error at", last_op[0], ":", e, "- re-enumerating")
-            if teardowns >= 3:
-                print("repeated faults - power-cycling YubiKey")
-                yubikey_power(False)
-                time.sleep(1.0)
-                yubikey_power(True)
-                teardowns = 0
+            recover_from_fault(e)
 
 
 main(IS_DEBUG)
