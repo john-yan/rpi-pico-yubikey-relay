@@ -3,6 +3,10 @@
 Wiring for the YubiKey USB relay: a Raspberry Pi Pico bridging a PC and a
 YubiKey, with firmware-controlled 5 V power to the downstream device.
 
+![Connection schematic](connection-schematic.svg)
+
+Regenerate the drawing with `make schematic` (source: `utils/gen_schematic.py`).
+
 ## System overview
 
 ```

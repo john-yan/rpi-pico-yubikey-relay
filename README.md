@@ -10,7 +10,9 @@ relaying FIDO2/WebAuthn traffic (and optionally OTP keystrokes) transparently.
 ```
 
 Full wiring — pinout, the GP5 dual-transistor power switch, and assembly
-cautions — is in [SCHEMATIC.md](SCHEMATIC.md).
+cautions — is in [SCHEMATIC.md](SCHEMATIC.md). The schematic sheet itself:
+
+![Connection schematic](connection-schematic.svg)
 
 ## Files
 

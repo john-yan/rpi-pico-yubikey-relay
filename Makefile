@@ -13,7 +13,7 @@ CP_URL = https://downloads.circuitpython.org/bin/raspberry_pi_pico/en_US/adafrui
 RULES_FILE = 70-pico-yubikey-relay.rules
 RULES_DEST = /etc/udev/rules.d/$(RULES_FILE)
 
-.PHONY: help download flash deploy deploy-debug reset test e2e check debug log install-rules remove-rules clean
+.PHONY: help download flash deploy deploy-debug reset test unit e2e schematic check debug log install-rules remove-rules clean
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | \
@@ -70,6 +70,9 @@ unit: ## Run the host-side unit tests (no hardware needed)
 
 e2e: ## Full pipeline: deploy production code, soft-reload, verify, capture log
 	python3 test/e2e_test.py
+
+schematic: ## Regenerate connection-schematic.svg (utils/gen_schematic.py)
+	python3 utils/gen_schematic.py
 
 log: ## Passively listen to the relay console (SECS=15)
 	python3 utils/listen_repl.py $(SECS)
