@@ -65,9 +65,9 @@ def pad(b):
     return b + b"\x00" * (64 - len(b))
 
 
-def make_svc():
+def make_svc(sticky=False):
     TS.time = FakeTime()  # monkeypatch the module's clock
-    svc = TS.TokenService()
+    svc = TS.TokenService(sticky=sticky)
     svc.port = MockPort()
     svc.sender = lambda pkt: sent.append(pkt)
     return svc
@@ -195,6 +195,29 @@ check(
     "GOODBYE clears token + daemon flag",
     svc.token is None and svc.daemon_alive is False,
 )
+
+# ---- sticky mode (AUTOUV_STICKY) ------------------------------------------
+# A cached token alone keeps the persona on; no daemon liveness required.
+# GOODBYE and on_attach remain the kill paths.
+st = make_svc(sticky=True)
+st.port.feed({"c": "SET_TOKEN", "h": "44" * 32, "p": 2})
+st.poll()
+check("sticky: token alone keeps active() on", st.active() is True)
+TS.time.now += 3600.0  # a year of no daemon contact
+check("sticky: stale contact irrelevant", st.active() is True)
+st.port.feed({"c": "GOODBYE"})
+st.poll()
+check("sticky: GOODBYE still clears (explicit kill switch)", st.active() is False)
+st.port.feed({"c": "SET_TOKEN", "h": "55" * 32, "p": 2})
+st.poll()
+check("sticky: re-armed after GOODBYE", st.active() is True)
+st.on_attach()
+check("sticky: key re-attach clears (power-state bound)", st.active() is False)
+nst = make_svc(sticky=False)
+nst.port.feed({"c": "SET_TOKEN", "h": "66" * 32, "p": 2})
+nst.poll()
+nst.daemon_alive = False
+check("non-sticky default unchanged: daemon liveness still required", nst.active() is False)
 
 # ---- attach lifecycle -------------------------------------------------------
 svc.port.feed({"c": "SET_TOKEN", "h": "22" * 32, "p": 2})

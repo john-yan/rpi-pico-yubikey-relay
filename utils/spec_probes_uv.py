@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Phase-4 acceptance probes: persona-shaped UV requests through the relay.
 
-RUN WITH THE DAEMON UP (utils/autouv_daemon.py) so the persona is on and
+RUN AFTER ARMING (utils/autouv.py) so the persona is on and
 a token is cached. These are the exact wire shapes Chrome produces for a
 bio-persona key (options uv:true, no pinUvAuthParam) - before the
 injector they failed with UNSUPPORTED_OPTION (phase-0 P5f).
@@ -58,7 +58,7 @@ def main():
     print("persona GetInfo options:", ctap.info.options)
     if ctap.info.options.get("uv") is not True:
         print("PERSONA IS OFF - start the daemon first "
-              "(python3 utils/autouv_daemon.py)")
+              "(python3 utils/autouv.py)")
         sys.exit(1)
 
     print("\n>>> UV1: makeCredential {uv:true} (touch when the key blinks)")

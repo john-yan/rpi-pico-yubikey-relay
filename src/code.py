@@ -40,6 +40,7 @@ from config import (
     ALLOWED_VIDS,
     ATTACH_TIMEOUT,
     AUTO_TOUCH_DELAY,
+    AUTOUV_STICKY,
     AUTO_TOUCH_HOLD,
     AUTOUV,
     CLASS_HID,
@@ -334,7 +335,9 @@ def main(is_debug=False):
     # pinUvAuthToken pushed by the host daemon over the CDC data port — the
     # PIN itself never leaves the host. Daemon absent/expired -> persona off
     # -> normal Chrome PIN prompts (safe fallback).
-    token_svc = token_service.TokenService()
+    # Sticky mode (config): a cached token alone keeps the persona on;
+    # the daemon may exit after pushing it. GOODBYE still kills.
+    token_svc = token_service.TokenService(sticky=AUTOUV_STICKY)
 
     _pending_req = {}  # cid -> CTAP2 command byte of the outstanding request
 

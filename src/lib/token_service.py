@@ -1,7 +1,7 @@
 # token_service.py — Auto-UV phase 3 (plan.md §5.4): the Pico side of the
 # token service.
 #
-# A host daemon (utils/autouv_daemon.py) holds the FIDO2 PIN and runs the
+# A host script (utils/autouv.py) holds the FIDO2 PIN and runs the
 # CTAP2 clientPIN PAKE with the YubiKey over a PRIVATE CTAPHID channel
 # that this service brokers over the CDC data port. The PIN never reaches
 # the Pico; only the resulting pinUvAuthToken does — and that is scoped to
@@ -41,7 +41,7 @@ WAITING = 2
 
 
 class TokenService:
-    def __init__(self):
+    def __init__(self, sticky=False):
         self.port = None  # usb_cdc.data (bound by code.py; None = no data CDC)
         self.sender = None  # callback: 64-byte packet -> downstream EP
         self.buf = b""
@@ -50,6 +50,11 @@ class TokenService:
         self.token_proto = 0
         self.daemon_alive = False
         self.last_contact = 0.0
+        # Sticky mode (config AUTOUV_STICKY): a cached token alone keeps
+        # the persona on - the daemon may exit after pushing it and the
+        # token's exposure window is the key's power state instead of the
+        # daemon's lifetime.
+        self.sticky = sticky
         # broker exchange state
         self.state = IDLE
         self.deadline = 0.0
@@ -67,10 +72,20 @@ class TokenService:
         self.state = IDLE
 
     def active(self):
-        """Persona gate: live token + recently heard-from daemon."""
+        """Persona gate.
+
+        Sticky mode: a cached token alone keeps the persona on; the token
+        still dies with the key's power state (on_attach clears it on
+        re-attach/power-cycle) and GOODBYE is the explicit kill switch.
+        Non-sticky (original semantics): additionally require a daemon
+        that heartbeated within HEARTBEAT_TIMEOUT.
+        """
+        if self.token is None:
+            return False
+        if self.sticky:
+            return True
         return (
-            self.token is not None
-            and self.daemon_alive
+            self.daemon_alive
             and time.monotonic() - self.last_contact < HEARTBEAT_TIMEOUT
         )
 

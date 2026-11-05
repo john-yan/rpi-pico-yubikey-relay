@@ -1,34 +1,41 @@
 #!/usr/bin/env python3
-"""Auto-UV token daemon — plan.md §5.4, phase 3.
+"""Auto-UV control — arm/disarm the relay's UV persona (plan.md §5.4).
 
 Holds the FIDO2 PIN on the host and performs the CTAP2 clientPIN PAKE
 with the YubiKey THROUGH the relay's CDC-brokered private channel (the
-daemon must not touch /dev/hidraw3 directly: Linux hidraw does not fan
+script must not touch /dev/hidraw3 directly: Linux hidraw does not fan
 out reads, so it would steal Chrome's packets mid-ceremony). Pushes the
 resulting pinUvAuthToken (plaintext, protocol 2, legacy unscoped —
 phase-0 finding) to the Pico, which gates the persona on it.
 
 The Pico never sees the PIN. The token is power-cycle-scoped: the Pico
-drops it when the key re-attaches and this daemon re-acquires (epoch
-watch in the heartbeat loop).
+drops it when the key re-attaches — re-run this script to re-arm.
 
 Usage:
-    python3 utils/autouv_daemon.py [--port /dev/ttyACM1] [--once] [-v]
+    python3 utils/autouv.py [--port /dev/ttyACM1] [-v]
 
-    --once   acquire the token, push it, verify, exit (no heartbeat loop)
+Default (no flags): acquire the token, push it, exit. With
+AUTOUV_STICKY=True (config.py, shipped) the persona stays ON until the
+key re-attaches/power-cycles or a GOODBYE is sent. This is the normal
+mode of operation.
+
+    --daemon    keep running after arming: heartbeat and re-acquire on
+                token loss (pre-sticky behavior); Ctrl-C sends GOODBYE
+    --goodbye   disarm only: send GOODBYE and exit. No PIN is needed
+                (or read) for this mode.
 
 PIN source (first found): PICO_RELAY_PIN env, .pin next to this
 script / in cwd / in the repo root, else getpass.
 
 Lockout safety (plan.md §5.4): getPinRetries is checked before every
-acquisition and the daemon refuses to run below 3. Exactly one token
+acquisition and the script refuses to run below 3. Exactly one token
 attempt per acquisition; on PIN_INVALID it NEVER retries — it says so
 loudly and exits 2. A bug here must not eat the 3-strike/8-total FIDO
 lockout budget.
 
-Exit codes: 0 = daemon stopped cleanly (GOODBYE sent), 1 = transport /
-protocol failure, 2 = PIN rejected (auto-UV disabled, fix the PIN and
-restart), 3 = lockout guard refused to run.
+Exit codes: 0 = clean exit (token pushed, or GOODBYE sent), 1 =
+transport / protocol failure, 2 = PIN rejected (auto-UV disabled, fix
+the PIN and restart), 3 = lockout guard refused to run.
 """
 
 import argparse
@@ -264,16 +271,34 @@ def acquire_token(relay, pin):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", default="/dev/ttyACM1")
-    ap.add_argument("--once", action="store_true",
-                    help="acquire and push the token, then exit")
+    ap.add_argument("--daemon", action="store_true",
+                    help="keep running after arming: heartbeat and "
+                         "re-acquire on token loss; Ctrl-C sends GOODBYE")
+    ap.add_argument("--goodbye", action="store_true",
+                    help="disarm only: send GOODBYE (persona off) and "
+                         "exit; no PIN is read in this mode")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
+
+    relay = Relay(args.port, verbose=args.verbose)
+
+    if args.goodbye:
+        # Disarm needs no PIN (and must never prompt for one).
+        try:
+            r = relay.cmd({"c": "GOODBYE"}, "ACK", timeout=2.0)
+            print(
+                f"GOODBYE accepted (epoch {r.get('e')}) - persona off; "
+                "Chrome PIN prompts are back"
+            )
+        except (TimeoutError, OSError) as e:
+            print(f"no reply from the relay: {e}")
+            sys.exit(1)
+        return
 
     # NOTE: no --pin flag on purpose - a PIN on the command line is
     # readable by every local user via /proc/*/cmdline (plan.md §5.4).
     # Use PICO_RELAY_PIN (environ is same-user-only), .pin, or getpass.
     pin = read_pin()
-    relay = Relay(args.port, verbose=args.verbose)
 
     print(f"connecting to relay on {args.port} ...")
     w = relay.hello()
@@ -285,9 +310,13 @@ def main():
         print(f"token acquired ({len(token)} bytes) and pushed - persona is ON")
 
     acquire_and_push()
-    if args.once:
-        relay.goodbye()
-        print("exiting (--once); persona falls back off until the next run")
+
+    if not args.daemon:
+        # Default mode: sticky token. The persona stays on (config
+        # AUTOUV_STICKY) until the key re-attaches/power-cycles or a
+        # GOODBYE is sent - no heartbeat process required.
+        print("exiting - persona stays ON (sticky) until the key re-attaches")
+        print("or a GOODBYE is sent (autouv.py --goodbye)")
         return
 
     print("heartbeat loop started (Ctrl-C to stop -> persona off)")

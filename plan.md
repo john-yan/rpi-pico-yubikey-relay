@@ -84,9 +84,9 @@ complexity). **Split it:**
    │                                     ▼  │
    │                            CDC serial │
    └──────────── token service ────────────┘
-             utils/autouv_daemon.py  (host, CPython)
+             utils/autouv.py  (host, CPython)
 
-  autouv_daemon.py  — holds the PIN (from user's keyring/config, 0600),
+  autouv.py  — holds the PIN (from user's keyring/config, 0600),
                       runs the full clientPIN PAKE through the Pico's
                       brokered private channel, derives pinUvAuthToken,
                       pushes {token, protocol, permissions, rpId} to the
@@ -203,7 +203,7 @@ Fail-open rule: if no token can be obtained, forward the request
 unmodified (UV=preferred sites still work touch-only; UV=required sites
 fail at the RP — visible, not silent) and blink the LED / log via CDC.
 
-### 5.4 Token service (daemon `utils/autouv_daemon.py` + Pico side)
+### 5.4 Token service (`utils/autouv.py` + Pico side)
 
 CDC serial protocol (newline-framed JSON or compact binary; JSON is fine at
 this rate):
@@ -254,12 +254,18 @@ What we give up / accept:
    power-cycle-scoped but **unscoped by permission and rpId** (a firmware
    limitation: fw 5.4.3 rejects the CTAP2.1 scoped-token subcommand,
    phase-0 P2b). Stealing the YubiKey alone still does *not* yield UV.
-   Consequence, stated plainly: while the daemon is live, ANY process in
+   Consequence, stated plainly: while a token is live, ANY process in
    the user's session can obtain UV=true assertions for any RP without
-   knowing the PIN (auto-touch supplies presence after 1 s). The optional
-   `UV_RPIDS` allowlist in config.py restricts injection to listed RP IDs;
-   empty (shipped default) allows all. This is the deliberate
-   convenience-for-assurance trade the user has chosen.
+   knowing the PIN (auto-touch supplies presence after 1 s). With
+   `AUTOUV_STICKY=True` (shipped) the token's exposure window is the
+   key's power state - the daemon may exit after a `--once --sticky`
+   acquisition - instead of the daemon's lifetime; any re-attach or
+   power-cycle clears it (on_attach), and GOODBYE (Ctrl-C on a live
+   daemon) is the explicit kill switch. The optional `UV_RPIDS`
+   allowlist in config.py restricts injection to listed RP IDs; empty
+   (shipped default) allows all - populating it is recommended in
+   sticky mode. This is the deliberate convenience-for-assurance trade
+   the user has chosen.
    - CDC control-plane note (review finding): the ttyACM1 protocol is
      unauthenticated and the Pico side has no lockout guard — but the same
      local principals already have direct hidraw access to the key via the
@@ -320,7 +326,7 @@ What we give up / accept:
   data port (ttyACM1); src/lib/token_service.py implements the Pico side
   (private-channel allocation via nonce-matched CTAPHID INIT, brokered
   CTAP2 exchanges with their own assembler, token cache, heartbeat/
-  epoch gating); utils/autouv_daemon.py holds the PIN on the host and
+  epoch gating); utils/autouv.py holds the PIN on the host and
   runs the full clientPIN PAKE (protocol 2, hand-rolled against the
   python-fido2 reference) through the broker. Persona is now gated on a
   live token + fresh daemon heartbeat (fallback: off -> Chrome PIN

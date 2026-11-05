@@ -108,6 +108,16 @@ UV_POLICY = "follow"
 # inject for any RP.
 UV_RPIDS = ()
 
+# Sticky token: when True, a cached token alone keeps the persona on -
+# the control script may exit after pushing it (autouv.py, default
+# mode) instead of having to heartbeat forever (--daemon). The token still
+# dies with the key's power state (any re-attach clears it) and GOODBYE
+# (Ctrl-C on a live daemon) still clears it explicitly. Trade (plan.md
+# §6): the unscoped token's exposure window becomes "key powered"
+# instead of "daemon running" - populate UV_RPIDS to restrict which RPs
+# can use it. False restores the original heartbeat-gated semantics.
+AUTOUV_STICKY = True
+
 # ------------------------------------------------- 6. debug tracing
 
 # Packet tracing: set True (or run `make deploy-debug`) to log the first

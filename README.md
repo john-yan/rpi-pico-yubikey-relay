@@ -28,7 +28,7 @@ cautions — is in [SCHEMATIC.md](SCHEMATIC.md). The schematic sheet itself:
 | `src/lib/injector.py` | Auto-UV injector: strips `options.uv`, splices `pinUvAuthParam = HMAC(token, clientDataHash)`; `UV_POLICY`/`UV_RPIDS` knobs in config.py. **Deploy to CIRCUITPY/lib.** |
 | `src/lib/sha256.py` | Pure-Python SHA-256 (the RP2040 CircuitPython build has no `hashlib.sha256`). **Deploy to CIRCUITPY/lib.** |
 | `src/lib/token_service.py` | Pico side of the Auto-UV token service: CDC protocol (ttyACM1), private-channel broker, token cache. **Deploy to CIRCUITPY/lib.** |
-| `utils/autouv_daemon.py` | Host daemon: holds the FIDO2 PIN, acquires the pinUvAuthToken through the relay, gates the persona. Run: `python3 utils/autouv_daemon.py` (needs `pyserial` + `cryptography`; PIN from `PICO_RELAY_PIN`, `.pin`, or getpass — never a CLI flag). |
+| `utils/autouv.py` | Auto-UV control: arms the persona (default: acquire the pinUvAuthToken through the relay, push it, exit — with `AUTOUV_STICKY=True` it stays on until the key re-attaches or a GOODBYE), `--daemon` keeps a heartbeat loop, `--goodbye` disarms without reading the PIN. Needs `pyserial` + `cryptography`; PIN from `PICO_RELAY_PIN`, `.pin`, or getpass — never a CLI flag. |
 | `plan.md` | Design doc: Auto-UV (PIN auto-entry) — architecture, verified spec facts (phase-0 probes), phased implementation plan |
 | `test/test_ctaphid.py` | Host-side verification: CTAPHID INIT + multi-packet PING through the relay (hardware) |
 | `test/test_persona.py`, `test/test_injector.py`, `test/test_ctaphid_proxy.py`, `test/test_token_service.py` | Host-runnable unit tests (no hardware): `make unit` |
@@ -160,11 +160,13 @@ TinyUSB-based build like the Feather RP2040 USB Host's Arduino offering).
 - **Keyboard mode is a keystroke-injection bridge by design**: whatever
   the downstream (allowlisted) device reports is typed verbatim into the
   host. Treat the breakout connection as keyboard input.
-- **Auto-UV security model (read before enabling)**: while the daemon is
+- **Auto-UV security model (read before enabling)**: while a token is
   live, ANY process in the user's session can obtain `UV=true` assertions
   from the relayed key without knowing the PIN (the token is the legacy
   *unscoped* one — fw 5.4.3 rejects scoped tokens — and auto-touch supplies
-  presence after 3 s). That is the deliberate convenience-for-assurance
+  presence after 1 s). With `AUTOUV_STICKY=True` (shipped) that window is
+  the key's power state — the daemon need not stay running; GOODBYE or any
+  re-attach clears it. That is the deliberate convenience-for-assurance
   trade of this feature; `UV_RPIDS` in config.py can restrict injection to
   an allowlist of relying-party IDs. Unplugging the daemon (or Ctrl-C)
   restores PIN-based UV immediately.
