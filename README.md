@@ -2,6 +2,9 @@
 
 A Raspberry Pi Pico (CircuitPython) that sits between your PC and a YubiKey,
 relaying FIDO2/WebAuthn traffic (and optionally OTP keystrokes) transparently.
+On top of the transparent pipe it can optionally automate the two human
+steps of FIDO2 — the PIN entry (Auto-UV) and the touch (auto-touch) — see
+[Usage](#usage) and [plan.md](plan.md).
 
 ```
 [ PC ] ──Pico's native micro-USB── [ Raspberry Pi Pico ] ──GP16/GP17 + VBUS── [ YubiKey ]
@@ -13,6 +16,112 @@ Full wiring — pinout, the GP5 dual-transistor power switch, and assembly
 cautions — is in [SCHEMATIC.md](SCHEMATIC.md). The schematic sheet itself:
 
 ![Connection schematic](connection-schematic.svg)
+
+## Usage
+
+### LED language
+
+| LED | Meaning |
+|---|---|
+| slow blink | waiting for the YubiKey to attach (or power-cycling it) |
+| fast blink (~8 Hz) | the YubiKey is waiting for a (real or simulated) touch |
+| solid | relay attached and running |
+
+### Plain relay (no Auto-UV)
+
+Plug in and use: the PC sees a CTAPHID device, Chrome/luci prompt for the
+FIDO2 PIN and touch exactly as with the key connected directly. Nothing
+to run, nothing to configure.
+
+### What Auto-UV automates
+
+Two independent automations, both configurable in `src/config.py`:
+
+**Auto-PIN — the persona + injector.** Arming runs the real CTAP2
+clientPIN handshake with the YubiKey *once*, on the host (`autouv.py`
+holds the PIN; the Pico never sees it), and caches the resulting
+pinUvAuthToken on the Pico. From then on the relay presents the key to
+Chrome as one with built-in biometric UV (GetInfo persona: `uv:true`,
+no `clientPin`), so Chrome never shows a PIN dialog. When a ceremony
+needs UV, the relay splices
+`pinUvAuthParam = HMAC(token, clientDataHash)` into the request — the
+key verifies it and sets `UV=true` itself, so relying parties receive a
+genuine, key-signed UV bit. The PIN is used exactly once per arm, never
+per ceremony. Knobs: `AUTOUV`, `AUTOUV_STICKY`, `UV_POLICY`,
+`UV_RPIDS`.
+
+**Auto-touch — the simulated finger.** When the key asks for user
+presence (CTAPHID keepalive "waiting for touch"), the relay first waits
+`AUTO_TOUCH_DELAY` (1 s) for your real finger — physically touching
+the key always works and always wins. If nobody touches, GP15 pulls
+the key's touch input low for `AUTO_TOUCH_HOLD` (1 s) and the ceremony
+proceeds unattended. This is what makes UV-required flows (passkey
+login, passwordless) fully hands-off. Knobs: `AUTO_TOUCH_DELAY`,
+`AUTO_TOUCH_HOLD`.
+
+Both act only while a token is live (see the re-arm signal below);
+disarmed, the relay is a plain pipe with real PIN prompts and real
+touches.
+
+### Auto-UV (skip the Chrome PIN prompts)
+
+One-time setup — put the FIDO2 PIN where the control script can read it
+(never on the command line, which every local user can see in
+`/proc/*/cmdline`):
+
+```sh
+echo 'your-pin' > .pin && chmod 600 .pin   # repo root; git-ignored
+# or: export PICO_RELAY_PIN=...                # per-shell alternative
+```
+
+Day to day:
+
+```sh
+python3 utils/autouv.py            # ARM: acquire token, exit; persona stays on
+python3 utils/autouv.py --goodbye  # DISARM: persona off, Chrome PIN prompts back
+python3 utils/autouv.py --daemon   # optional: keep running, re-acquire on loss
+```
+
+- **Armed** (`AUTOUV_STICKY=True`, shipped): Chrome believes the key has
+  built-in UV — no PIN dialog; assertions still carry genuine `UV=true`
+  signed by the key. The token survives until the key re-attaches or
+  power-cycles, or a GOODBYE is sent. No background process is needed.
+- **The signal to re-arm**: Chrome suddenly shows PIN prompts again (the
+  key was replug/power-cycled and the token died with it) — re-run
+  `autouv.py`.
+- **Disarming needs no PIN**: `--goodbye` returns before the PIN is ever
+  read.
+- `--daemon` is the belt-and-suspenders mode: it heartbeats and
+  re-acquires automatically; Ctrl-C sends GOODBYE.
+
+Read [plan.md §6](plan.md) before relying on this: while a token is
+live, any process in your session can obtain `UV=true` assertions
+without the PIN (the token is unscoped on this firmware). `UV_RPIDS` in
+`src/config.py` can restrict which relying parties get injection.
+
+### Everyday checks
+
+```sh
+make test          # CTAPHID INIT + PING through the relay
+make unit          # host-side unit tests, no hardware
+make log SECS=15   # watch the relay console (DIAG dumps, attach messages)
+make deploy        # redeploy firmware after editing src/
+```
+
+### Troubleshooting quick hits
+
+- **A ceremony failed once with a CTAPHID error** — the known ~5–10 %
+  downstream packet-loss race; the relay already sent the client a clean
+  retryable error. Just retry the ceremony. If it recurs, capture
+  `make log` output when it happens (that is the open bug's missing
+  evidence).
+- **Chrome shows PIN prompts although Auto-UV was armed** — token lost
+  (replug/power-cycle); re-run `autouv.py`.
+- **`autouv.py` exits 2 (PIN rejected)** — fix `.pin`; it never retries
+  (lockout safety), so the retry budget is intact.
+- **Relay wedged after unplug/replug** — the self-heal should
+  power-cycle the key within ~5 s; if the LED keeps slow-blinking,
+  `make reset`.
 
 ## Files
 
